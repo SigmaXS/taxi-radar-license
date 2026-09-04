@@ -10,7 +10,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 
-// Начальные 20 ключей на 1 месяц (720 часов)
+// Стартовая база ключей на 30 дней
 const INITIAL_KEYS = {
   "VIP3-7K92-M8X4": { durationHours: 720, type: "30 дней" },
   "VIP3-3B19-TX85": { durationHours: 720, type: "30 дней" },
@@ -63,7 +63,6 @@ function saveData(data) {
   }
 }
 
-// Генератор формата XXXX-XXXX-XXXX
 function generateCode(prefix = "VIP3") {
   const chars = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
   let r1 = "", r2 = "";
@@ -72,30 +71,63 @@ function generateCode(prefix = "VIP3") {
   return `${prefix}-${r1}-${r2}`;
 }
 
-// Редирект с главной сразу в админку
 app.get('/', (req, res) => {
   res.redirect('/admin/view-devices');
 });
 
-// --- API ДЛЯ ANDROID-ПРИЛОЖЕНИЯ ---
+// 1. Автоматический пробный период (3 дня = 72 часа)
+app.post('/api/request-trial', (req, res) => {
+  const { device_id } = req.body;
+  if (!device_id) return res.status(400).json({ valid: false, message: "Нет ID устройства" });
 
-// 1. Активация ключа на конкретном телефоне
+  const db = loadData();
+
+  if (db.devices[device_id]) {
+    const dev = db.devices[device_id];
+    if (dev.status === 'banned') {
+      return res.json({ valid: false, message: "Устройство заблокировано (БАН)!" });
+    }
+    const isExpired = new Date(dev.expires).getTime() < Date.now();
+    if (isExpired) {
+      return res.json({ valid: false, message: "Пробный период завершен. Введите ключ." });
+    }
+    return res.json({ valid: true, expires: dev.expires, message: "Пробный период активен" });
+  }
+
+  const expireDate = new Date(Date.now() + 72 * 3600 * 1000);
+  const trialKey = generateCode("TR3D");
+
+  db.devices[device_id] = {
+    key: trialKey,
+    expires: expireDate.toISOString(),
+    lastSeen: new Date().toISOString(),
+    status: 'active',
+    type: "Пробный (3 дня)"
+  };
+
+  saveData(db);
+  return res.json({
+    valid: true,
+    message: "Активирован бесплатный доступ на 3 дня!",
+    expires: expireDate.toISOString()
+  });
+});
+
+// 2. Активация платного ключа
 app.post('/api/activate-device', (req, res) => {
   const { key, device_id } = req.body;
   if (!key || !device_id) {
-    return res.status(400).json({ valid: false, message: "Введите ключ и ID" });
+    return res.status(400).json({ valid: false, message: "Введите ключ и ID устройства" });
   }
 
   const cleanKey = key.trim().toUpperCase();
   const db = loadData();
 
-  // Проверка: забанено ли устройство
   const existingDev = db.devices[device_id];
   if (existingDev && existingDev.status === 'banned') {
     return res.json({ valid: false, message: "Это устройство заблокировано (БАН)!" });
   }
 
-  // Проверка: не занят ли ключ другим телефоном
   for (const [dId, dev] of Object.entries(db.devices)) {
     if (dev.key === cleanKey && dId !== device_id && dev.status !== 'banned') {
       return res.json({ valid: false, message: "Этот ключ уже активирован на другом устройстве!" });
@@ -127,31 +159,16 @@ app.post('/api/activate-device', (req, res) => {
   });
 });
 
-// 2. Фоновая проверка статуса лицензии
+// 3. Фоновая проверка лицензии
 app.post('/api/check-license', (req, res) => {
-  const { device_id, key } = req.body;
+  const { device_id } = req.body;
+  if (!device_id) return res.status(400).json({ valid: false, message: "Нет ID" });
+
   const db = loadData();
+  const dev = db.devices[device_id];
 
-  // Поиск по device_id или ключу
-  let targetDeviceId = device_id;
-  if (!targetDeviceId && key) {
-    const cleanKey = key.trim().toUpperCase();
-    for (const [dId, dev] of Object.entries(db.devices)) {
-      if (dev.key === cleanKey) {
-        targetDeviceId = dId;
-        break;
-      }
-    }
-  }
-
-  if (!targetDeviceId || !db.devices[targetDeviceId]) {
-    return res.json({ valid: false, message: "Лицензия не найдена" });
-  }
-
-  const dev = db.devices[targetDeviceId];
-  if (dev.status === 'banned') {
-    return res.json({ valid: false, message: "Устройство заблокировано администратором" });
-  }
+  if (!dev) return res.json({ valid: false, message: "Устройство не найдено" });
+  if (dev.status === 'banned') return res.json({ valid: false, message: "Устройство заблокировано" });
 
   const now = new Date();
   const expireDate = new Date(dev.expires);
@@ -164,16 +181,10 @@ app.post('/api/check-license', (req, res) => {
   saveData(db);
 
   const diffHours = Math.round((expireDate - now) / 3600000);
-  return res.json({
-    valid: true,
-    message: "Лицензия активна",
-    expires: dev.expires,
-    hours_left: diffHours
-  });
+  return res.json({ valid: true, expires: dev.expires, hours_left: diffHours });
 });
 
-// --- ВЕБ-ПАНЕЛЬ АДМИНИСТРАТОРА ---
-
+// Веб-админка
 app.get('/admin/view-devices', (req, res) => {
   const db = loadData();
   const now = Date.now();
@@ -220,8 +231,6 @@ app.get('/admin/view-devices', (req, res) => {
     `<li><b style="color:#d69e2e;">${k.key}</b> — (${k.type})</li>`
   ).join('');
 
-  const unusedCount = Object.keys(db.keys).length;
-
   res.send(`
     <!DOCTYPE html>
     <html lang="ru">
@@ -262,7 +271,7 @@ app.get('/admin/view-devices', (req, res) => {
           <form method="POST" action="/admin/generate"><button name="type" value="sub_7d" class="gen-btn btn-green">+ 7 дней</button></form>
           <form method="POST" action="/admin/generate"><button name="type" value="sub_30d" class="gen-btn btn-green">+ 30 дней</button></form>
         </div>
-        <b>Созданные в этой сессии (доступно в базе: ${unusedCount}):</b>
+        <b>Созданные в этой сессии:</b>
         <ul class="session-keys">
           ${sessionKeysList || '<li>Кликните по любой кнопке выше, чтобы создать ключ</li>'}
         </ul>
@@ -281,7 +290,7 @@ app.get('/admin/view-devices', (req, res) => {
             </tr>
           </thead>
           <tbody>
-            ${devicesList || '<tr><td colspan="5" style="text-align:center;color:#a0aec0;padding:25px;">Нет активированных устройств</td></tr>'}
+            ${devicesList || '<tr><td colspan="5" style="text-align:center;color:#a0aec0;padding:25px;">Нет активных устройств</td></tr>'}
           </tbody>
         </table>
       </div>
@@ -290,7 +299,6 @@ app.get('/admin/view-devices', (req, res) => {
   `);
 });
 
-// Генерация новых ключей по кнопкам
 app.post('/admin/generate', (req, res) => {
   const { type } = req.body;
   let hours = 720, label = "30 дней";
@@ -313,7 +321,6 @@ app.post('/admin/generate', (req, res) => {
   res.redirect('/admin/view-devices');
 });
 
-// Кнопки управления (Сбросить, Отвязать, В БАН)
 app.post('/admin/action', (req, res) => {
   const { device_id, action } = req.body;
   const db = loadData();
@@ -326,7 +333,6 @@ app.post('/admin/action', (req, res) => {
       db.keys[oldKey] = { durationHours: 720, type: "Восстановлен", created: new Date().toISOString() };
       delete db.devices[device_id];
     } else if (action === 'reset') {
-      // Продлевает подписку еще на 30 дней
       db.devices[device_id].expires = new Date(Date.now() + 720 * 3600 * 1000).toISOString();
       db.devices[device_id].status = 'active';
     }
