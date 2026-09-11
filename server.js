@@ -25,7 +25,7 @@ const INITIAL_KEYS = {
 
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) {
-    const initial = { keys: { ...INITIAL_KEYS }, devices: {}, createdSessionKeys: [] };
+    const initial = { keys: { ...INITIAL_KEYS }, devices: {}, trialHistory: [], createdSessionKeys: [] };
     fs.writeFileSync(DATA_FILE, JSON.stringify(initial, null, 2));
     return initial;
   }
@@ -33,10 +33,11 @@ function loadData() {
     const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     if (!parsed.keys) parsed.keys = { ...INITIAL_KEYS };
     if (!parsed.devices) parsed.devices = {};
+    if (!parsed.trialHistory) parsed.trialHistory = [];
     if (!parsed.createdSessionKeys) parsed.createdSessionKeys = [];
     return parsed;
   } catch (e) {
-    return { keys: { ...INITIAL_KEYS }, devices: {}, createdSessionKeys: [] };
+    return { keys: { ...INITIAL_KEYS }, devices: {}, trialHistory: [], createdSessionKeys: [] };
   }
 }
 
@@ -58,12 +59,14 @@ function generateCode(prefix = "VIP3") {
 
 app.get('/', (req, res) => res.redirect('/admin/view-devices'));
 
-// 1. Запрос триала на 3 дня
+// 1. Запрос триала на 3 дня (с защитой от повторного получения)
 app.post('/api/request-trial', (req, res) => {
   const { device_id } = req.body;
   if (!device_id) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
 
   const db = loadData();
+
+  // Если устройство уже есть в активных
   if (db.devices[device_id]) {
     const dev = db.devices[device_id];
     if (dev.status === 'banned') {
@@ -76,6 +79,16 @@ app.post('/api/request-trial', (req, res) => {
     return res.json({ valid: true, force_lock: false, expires: dev.expires, message: "Пробный период активен" });
   }
 
+  // ЕСЛИ УСТРОЙСТВО УЖЕ БРАЛО ТРИАЛ РАНЬШЕ (даже если его удалили из devices)
+  if (db.trialHistory.includes(device_id)) {
+    return res.json({ 
+      valid: false, 
+      force_lock: true, 
+      message: "Пробный период на этом устройстве уже был использован. Введите ключ." 
+    });
+  }
+
+  // Выдаем триал в первый раз
   const expireDate = new Date(Date.now() + 72 * 3600 * 1000);
   const trialKey = generateCode("TR3D");
 
@@ -87,7 +100,10 @@ app.post('/api/request-trial', (req, res) => {
     type: "Пробный (3 дня)"
   };
 
+  // Запоминаем навсегда, что этот ID уже получал триал
+  db.trialHistory.push(device_id);
   saveData(db);
+
   return res.json({
     valid: true,
     force_lock: false,
