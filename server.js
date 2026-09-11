@@ -14,7 +14,7 @@ const pool = new Pool({
 
 const INITIAL_KEYS = {
   "TEST-10SEC-DEMO": { durationHours: 10 / 3600, type: "Тест 10 секунд" },
-  "VIP3-7K92-M8X4": { durationHours: 720, type: "30 дней" },
+  "VIP3-7K92-M8X4": { durationHours: 720, type: "301 дней" },
   "VIP3-3B19-TX85": { durationHours: 720, type: "30 дней" },
   "VIP3-5F71-L2W9": { durationHours: 720, type: "30 дней" },
   "VIP3-8C44-P9K3": { durationHours: 720, type: "30 дней" },
