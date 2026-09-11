@@ -61,19 +61,19 @@ app.get('/', (req, res) => res.redirect('/admin/view-devices'));
 // 1. Запрос триала на 3 дня
 app.post('/api/request-trial', (req, res) => {
   const { device_id } = req.body;
-  if (!device_id) return res.status(400).json({ valid: false, message: "Нет ID" });
+  if (!device_id) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
 
   const db = loadData();
   if (db.devices[device_id]) {
     const dev = db.devices[device_id];
     if (dev.status === 'banned') {
-      return res.json({ valid: false, is_banned: true, message: "Устройство заблокировано (БАН)!" });
+      return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано (БАН)!" });
     }
     const isExpired = new Date(dev.expires).getTime() < Date.now();
     if (isExpired) {
-      return res.json({ valid: false, is_banned: false, message: "Пробный период завершен. Введите ключ." });
+      return res.json({ valid: false, force_lock: true, is_banned: false, message: "Пробный период завершен. Введите ключ." });
     }
-    return res.json({ valid: true, expires: dev.expires, message: "Пробный период активен" });
+    return res.json({ valid: true, force_lock: false, expires: dev.expires, message: "Пробный период активен" });
   }
 
   const expireDate = new Date(Date.now() + 72 * 3600 * 1000);
@@ -90,6 +90,7 @@ app.post('/api/request-trial', (req, res) => {
   saveData(db);
   return res.json({
     valid: true,
+    force_lock: false,
     message: "Активирован бесплатный доступ на 3 дня!",
     expires: expireDate.toISOString()
   });
@@ -99,7 +100,7 @@ app.post('/api/request-trial', (req, res) => {
 app.post('/api/activate-device', (req, res) => {
   const { key, device_id } = req.body;
   if (!key || !device_id) {
-    return res.status(400).json({ valid: false, message: "Введите ключ и ID" });
+    return res.status(400).json({ valid: false, force_lock: true, message: "Введите ключ и ID" });
   }
 
   const cleanKey = key.trim().toUpperCase();
@@ -107,18 +108,18 @@ app.post('/api/activate-device', (req, res) => {
 
   const existingDev = db.devices[device_id];
   if (existingDev && existingDev.status === 'banned') {
-    return res.json({ valid: false, is_banned: true, message: "Устройство в бане! Обратитесь к администратору." });
+    return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство в бане! Обратитесь к администратору." });
   }
 
   for (const [dId, dev] of Object.entries(db.devices)) {
     if (dev.key === cleanKey && dId !== device_id && dev.status !== 'banned') {
-      return res.json({ valid: false, message: "Этот ключ уже занят другим телефоном!" });
+      return res.json({ valid: false, force_lock: true, message: "Этот ключ уже занят другим телефоном!" });
     }
   }
 
   const keyData = db.keys[cleanKey];
   if (!keyData) {
-    return res.json({ valid: false, message: "Неверный ключ или уже активирован" });
+    return res.json({ valid: false, force_lock: true, message: "Неверный ключ или уже активирован" });
   }
 
   const expireDate = new Date(Date.now() + keyData.durationHours * 3600 * 1000);
@@ -136,6 +137,7 @@ app.post('/api/activate-device', (req, res) => {
 
   return res.json({
     valid: true,
+    force_lock: false,
     message: `Успешно! Доступ открыт (${keyData.type})`,
     expires: expireDate.toISOString()
   });
@@ -144,29 +146,29 @@ app.post('/api/activate-device', (req, res) => {
 // 3. Фоновая проверка
 app.post('/api/check-license', (req, res) => {
   const { device_id } = req.body;
-  if (!device_id) return res.status(400).json({ valid: false, message: "Нет ID" });
+  if (!device_id) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
 
   const db = loadData();
   const dev = db.devices[device_id];
 
-  if (!dev) return res.json({ valid: false, message: "Устройство не найдено" });
+  if (!dev) return res.json({ valid: false, force_lock: true, message: "Устройство не найдено" });
   
   if (dev.status === 'banned') {
-    return res.json({ valid: false, is_banned: true, message: "Устройство заблокировано администратором (БАН)" });
+    return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано администратором (БАН)" });
   }
 
   const serverNow = new Date();
   const expireDate = new Date(dev.expires);
 
   if (serverNow > expireDate) {
-    return res.json({ valid: false, is_banned: false, message: "Срок действия подписки истек" });
+    return res.json({ valid: false, force_lock: true, is_banned: false, message: "Срок действия подписки истек" });
   }
 
   dev.lastSeen = serverNow.toISOString();
   saveData(db);
 
   const diffHours = Math.max(0, Math.round((expireDate - serverNow) / 3600000));
-  return res.json({ valid: true, expires: dev.expires, hours_left: diffHours });
+  return res.json({ valid: true, force_lock: false, expires: dev.expires, hours_left: diffHours });
 });
 
 // Админ-панель
@@ -214,7 +216,6 @@ app.get('/admin/view-devices', (req, res) => {
     `;
   }).join('');
 
-  // Список свободных неактивированных ключей для выдачи
   const freeKeysList = Object.entries(db.keys).map(([k, val]) => `
     <div style="background:#f7fafc; padding:8px 12px; margin:5px 0; border-radius:6px; display:flex; justify-content:space-between; align-items:center; border:1px solid #e2e8f0;">
       <div><strong style="color:#2b6cb0;">${k}</strong> <span style="font-size:12px; color:#718096;">(${val.type})</span></div>
