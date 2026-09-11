@@ -185,16 +185,29 @@ app.post('/api/check-license', (req, res) => {
   return res.json({ valid: true, force_lock: false, expires: dev.expires, hours_left: diffHours });
 });
 
-// Админ-панель
+// Админ-панель с аналитикой
 app.get('/admin/view-devices', (req, res) => {
   const db = loadData();
   const now = Date.now();
 
+  let totalDevices = 0;
+  let onlineDevices = 0;
+  let activeSubs = 0;
+  let expiredSubs = 0;
+  let bannedDevices = 0;
+
   const devicesList = Object.entries(db.devices).map(([deviceId, dev]) => {
+    totalDevices++;
     const isBanned = dev.status === 'banned';
     const isExpired = new Date(dev.expires).getTime() < now;
     const lastSeenDiffMin = Math.round((now - new Date(dev.lastSeen).getTime()) / 60000);
     const isOnline = lastSeenDiffMin <= 5 && !isBanned && !isExpired;
+
+    if (isBanned) bannedDevices++;
+    else if (isExpired) expiredSubs++;
+    else activeSubs++;
+
+    if (isOnline) onlineDevices++;
 
     const expDate = new Date(dev.expires);
     const formattedDate = expDate.toLocaleString('ru-RU', {
@@ -236,15 +249,21 @@ app.get('/admin/view-devices', (req, res) => {
     </div>
   `).join('');
 
+  const totalTrialsUsed = db.trialHistory ? db.trialHistory.length : 0;
+  const freeKeysCount = Object.keys(db.keys).length;
+
   res.send(`
     <!DOCTYPE html>
     <html lang="ru">
     <head>
       <meta charset="UTF-8">
-      <title>Управление лицензиями</title>
+      <title>Аналитика и управление лицензиями</title>
       <style>
         body { font-family: sans-serif; background: #f0f2f5; padding: 25px; margin: 0; }
         .card { background: #fff; border-radius: 10px; padding: 20px; max-width: 1000px; margin: 0 auto 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 10px; }
+        .stat-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; text-align: center; }
+        .stat-num { font-size: 24px; font-weight: bold; color: #2b6cb0; margin-top: 5px; }
         .btn-group { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 15px; }
         .gen-btn { border: none; padding: 8px 14px; border-radius: 5px; color: #fff; font-weight: bold; cursor: pointer; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
@@ -254,6 +273,18 @@ app.get('/admin/view-devices', (req, res) => {
     </head>
     <body>
       <div class="card">
+        <h2>📊 Аналитика и Статистика</h2>
+        <div class="stats-grid">
+          <div class="stat-box"><div>Всего устройств</div><div class="stat-num">${totalDevices}</div></div>
+          <div class="stat-box"><div>⚡ Онлайн сейчас</div><div class="stat-num" style="color:#38a169;">${onlineDevices}</div></div>
+          <div class="stat-box"><div>✅ Активных</div><div class="stat-num" style="color:#3182ce;">${activeSubs}</div></div>
+          <div class="stat-box"><div>⏳ Истекли</div><div class="stat-num" style="color:#718096;">${expiredSubs}</div></div>
+          <div class="stat-box"><div>🚫 В бане</div><div class="stat-num" style="color:#e53e3e;">${bannedDevices}</div></div>
+          <div class="stat-box"><div>🎁 Взяли триал</div><div class="stat-num">${totalTrialsUsed}</div></div>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>🛠 Создать ключ</h2>
         <div class="btn-group">
           <form method="POST" action="/admin/generate"><button name="type" value="sub_10s" class="gen-btn" style="background:#e53e3e;">⚡ Тест 10 сек</button></form>
@@ -261,13 +292,14 @@ app.get('/admin/view-devices', (req, res) => {
           <form method="POST" action="/admin/generate"><button name="type" value="sub_7d" class="gen-btn" style="background:#38a169;">+ 7 дней</button></form>
           <form method="POST" action="/admin/generate"><button name="type" value="sub_30d" class="gen-btn" style="background:#2f855a;">+ 30 дней</button></form>
         </div>
-        <h3 style="margin-top:20px; font-size:16px;">Свободные ключи (${Object.keys(db.keys).length}):</h3>
+        <h3 style="margin-top:20px; font-size:16px;">Свободные ключи (${freeKeysCount}):</h3>
         <div style="max-height: 150px; overflow-y: auto;">
           ${freeKeysList || '<p style="color:#718096;">Нет свободных ключей</p>'}
         </div>
       </div>
+
       <div class="card">
-        <h2>🔑 Устройства (Всего: ${Object.keys(db.devices).length})</h2>
+        <h2>🔑 Устройства в базе</h2>
         <table>
           <thead>
             <tr><th>Статус</th><th>Ключ</th><th>ID Устройства</th><th>Истекает</th><th>Действие</th></tr>
@@ -288,6 +320,7 @@ app.post('/admin/generate', (req, res) => {
   if (type === 'sub_10s') { hours = 10 / 3600; label = "Тест 10 секунд"; }
   else if (type === 'sub_1d') { hours = 24; label = "1 день"; }
   else if (type === 'sub_7d') { hours = 168; label = "7 дней"; }
+  else if (type === 'sub_30d') { hours = 720; label = "30 дней"; }
 
   const newKey = generateCode(type === 'sub_10s' ? "TEST" : "VIP3");
   const db = loadData();
