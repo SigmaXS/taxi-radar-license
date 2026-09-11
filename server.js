@@ -205,7 +205,7 @@ app.get('/admin/view-devices', (req, res) => {
             <input type="hidden" name="device_id" value="${deviceId}">
             <button name="action" value="reset" style="background:#3182ce;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">+30 дней</button>
             ${isBanned 
-              ? '<button name="action" value="unban" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">Разбанить</button>'
+              ? '<button name="action" value="unban" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">Разбанить</button>' 
               : '<button name="action" value="ban" style="background:#e53e3e;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">В БАН</button>'}
             <button name="action" value="unlink" style="background:#dd6b20;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Удалить</button>
           </form>
@@ -213,6 +213,13 @@ app.get('/admin/view-devices', (req, res) => {
       </tr>
     `;
   }).join('');
+
+  // Список свободных неактивированных ключей для выдачи
+  const freeKeysList = Object.entries(db.keys).map(([k, val]) => `
+    <div style="background:#f7fafc; padding:8px 12px; margin:5px 0; border-radius:6px; display:flex; justify-content:space-between; align-items:center; border:1px solid #e2e8f0;">
+      <div><strong style="color:#2b6cb0;">${k}</strong> <span style="font-size:12px; color:#718096;">(${val.type})</span></div>
+    </div>
+  `).join('');
 
   res.send(`
     <!DOCTYPE html>
@@ -237,6 +244,10 @@ app.get('/admin/view-devices', (req, res) => {
           <form method="POST" action="/admin/generate"><button name="type" value="sub_1d" class="gen-btn" style="background:#38a169;">+ 1 день</button></form>
           <form method="POST" action="/admin/generate"><button name="type" value="sub_7d" class="gen-btn" style="background:#38a169;">+ 7 дней</button></form>
           <form method="POST" action="/admin/generate"><button name="type" value="sub_30d" class="gen-btn" style="background:#2f855a;">+ 30 дней</button></form>
+        </div>
+        <h3 style="margin-top:20px; font-size:16px;">Свободные ключи (${Object.keys(db.keys).length}):</h3>
+        <div style="max-height: 150px; overflow-y: auto;">
+          ${freeKeysList || '<p style="color:#718096;">Нет свободных ключей</p>'}
         </div>
       </div>
       <div class="card">
