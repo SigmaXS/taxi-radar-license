@@ -11,6 +11,7 @@ app.use(express.urlencoded({ extended: true }));
 const DATA_FILE = path.join(__dirname, 'data.json');
 
 const INITIAL_KEYS = {
+  "TEST-10SEC-DEMO": { durationHours: 10 / 3600, type: "Тест 10 секунд" },
   "VIP3-7K92-M8X4": { durationHours: 720, type: "30 дней" },
   "VIP3-3B19-TX85": { durationHours: 720, type: "30 дней" },
   "VIP3-5F71-L2W9": { durationHours: 720, type: "30 дней" },
@@ -59,14 +60,13 @@ function generateCode(prefix = "VIP3") {
 
 app.get('/', (req, res) => res.redirect('/admin/view-devices'));
 
-// 1. Запрос триала на 3 дня (с защитой от повторного получения)
+// 1. Запрос триала на 3 дня
 app.post('/api/request-trial', (req, res) => {
   const { device_id } = req.body;
   if (!device_id) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
 
   const db = loadData();
 
-  // Если устройство уже есть в активных
   if (db.devices[device_id]) {
     const dev = db.devices[device_id];
     if (dev.status === 'banned') {
@@ -79,8 +79,7 @@ app.post('/api/request-trial', (req, res) => {
     return res.json({ valid: true, force_lock: false, expires: dev.expires, message: "Пробный период активен" });
   }
 
-  // ЕСЛИ УСТРОЙСТВО УЖЕ БРАЛО ТРИАЛ РАНЬШЕ (даже если его удалили из devices)
-  if (db.trialHistory.includes(device_id)) {
+  if (db.trialHistory && db.trialHistory.includes(device_id)) {
     return res.json({ 
       valid: false, 
       force_lock: true, 
@@ -88,7 +87,6 @@ app.post('/api/request-trial', (req, res) => {
     });
   }
 
-  // Выдаем триал в первый раз
   const expireDate = new Date(Date.now() + 72 * 3600 * 1000);
   const trialKey = generateCode("TR3D");
 
@@ -100,7 +98,7 @@ app.post('/api/request-trial', (req, res) => {
     type: "Пробный (3 дня)"
   };
 
-  // Запоминаем навсегда, что этот ID уже получал триал
+  if (!db.trialHistory) db.trialHistory = [];
   db.trialHistory.push(device_id);
   saveData(db);
 
@@ -138,7 +136,7 @@ app.post('/api/activate-device', (req, res) => {
     return res.json({ valid: false, force_lock: true, message: "Неверный ключ или уже активирован" });
   }
 
-  const expireDate = new Date(Date.now() + keyData.durationHours * 3600 * 1000);
+  const expireDate = new Date(Date.now() + Math.round(keyData.durationHours * 3600 * 1000));
 
   db.devices[device_id] = {
     key: cleanKey,
@@ -201,7 +199,7 @@ app.get('/admin/view-devices', (req, res) => {
     const expDate = new Date(dev.expires);
     const formattedDate = expDate.toLocaleString('ru-RU', {
       day: '2-digit', month: '2-digit', year: 'numeric',
-      hour: '2-digit', minute: '2-digit'
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
 
     return `
@@ -258,6 +256,7 @@ app.get('/admin/view-devices', (req, res) => {
       <div class="card">
         <h2>🛠 Создать ключ</h2>
         <div class="btn-group">
+          <form method="POST" action="/admin/generate"><button name="type" value="sub_10s" class="gen-btn" style="background:#e53e3e;">⚡ Тест 10 сек</button></form>
           <form method="POST" action="/admin/generate"><button name="type" value="sub_1d" class="gen-btn" style="background:#38a169;">+ 1 день</button></form>
           <form method="POST" action="/admin/generate"><button name="type" value="sub_7d" class="gen-btn" style="background:#38a169;">+ 7 дней</button></form>
           <form method="POST" action="/admin/generate"><button name="type" value="sub_30d" class="gen-btn" style="background:#2f855a;">+ 30 дней</button></form>
@@ -286,10 +285,11 @@ app.get('/admin/view-devices', (req, res) => {
 app.post('/admin/generate', (req, res) => {
   const { type } = req.body;
   let hours = 720, label = "30 дней";
-  if (type === 'sub_1d') { hours = 24; label = "1 день"; }
+  if (type === 'sub_10s') { hours = 10 / 3600; label = "Тест 10 секунд"; }
+  else if (type === 'sub_1d') { hours = 24; label = "1 день"; }
   else if (type === 'sub_7d') { hours = 168; label = "7 дней"; }
 
-  const newKey = generateCode("VIP3");
+  const newKey = generateCode(type === 'sub_10s' ? "TEST" : "VIP3");
   const db = loadData();
   db.keys[newKey] = { durationHours: hours, type: label, created: new Date().toISOString() };
   saveData(db);
