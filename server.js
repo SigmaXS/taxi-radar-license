@@ -37,6 +37,13 @@ async function initDB() {
         device_id VARCHAR(100) PRIMARY KEY
       );
       ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_info VARCHAR(150);
+      CREATE TABLE IF NOT EXISTS referrals (
+        device_id VARCHAR(100) PRIMARY KEY,
+        code VARCHAR(12) UNIQUE NOT NULL,
+        referred_by VARCHAR(12),
+        rewarded BOOLEAN NOT NULL DEFAULT false,
+        created TIMESTAMP
+      );
     `);
     console.log("Database initialized successfully.");
   } catch (err) {
@@ -119,6 +126,117 @@ app.use('/admin', requireAdmin);
 
 app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
 
+function referralBonusDays() {
+  const days = parseInt(process.env.REFERRAL_BONUS_DAYS || '3', 10);
+  return Number.isFinite(days) && days > 0 ? days : 3;
+}
+
+// Контакты и ссылка на группу для приложения. Меняются переменными в Railway
+// без выпуска новой версии; пустое значение прячет кнопку в приложении.
+app.get('/api/app-config', (req, res) => {
+  const phone = process.env.CONTACT_PHONE ?? '+37378293919';
+  res.json({
+    telegram: process.env.CONTACT_TELEGRAM ?? 'sigmalxl',
+    whatsapp: process.env.CONTACT_WHATSAPP ?? phone,
+    viber: process.env.CONTACT_VIBER ?? phone,
+    phone,
+    group_url: process.env.GROUP_URL || '',
+    referral_bonus_days: referralBonusDays()
+  });
+});
+
+async function ensureReferralCode(deviceId) {
+  const existing = await pool.query('SELECT * FROM referrals WHERE device_id = $1', [deviceId]);
+  if (existing.rows.length > 0) return existing.rows[0];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateCode("R").slice(2).replace('-', '').slice(0, 6);
+    const inserted = await pool.query(
+      'INSERT INTO referrals (device_id, code, created) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING *',
+      [deviceId, code, new Date()]
+    );
+    if (inserted.rows.length > 0) return inserted.rows[0];
+    const again = await pool.query('SELECT * FROM referrals WHERE device_id = $1', [deviceId]);
+    if (again.rows.length > 0) return again.rows[0];
+  }
+  throw new Error('Не удалось создать реферальный код');
+}
+
+async function deviceExists(deviceId) {
+  const r = await pool.query('SELECT 1 FROM devices WHERE device_id = $1', [deviceId]);
+  return r.rows.length > 0;
+}
+
+// Бонус пригласившему — только когда приглашённый купил ключ (не триал),
+// иначе рефералку можно накрутить фейковыми устройствами. Один раз на друга.
+async function rewardReferrer(deviceId) {
+  const claimed = await pool.query(
+    'UPDATE referrals SET rewarded = true WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by',
+    [deviceId]
+  );
+  if (claimed.rows.length === 0) return;
+  const referrer = await pool.query(
+    'SELECT d.device_id, d.expires, d.status FROM referrals r JOIN devices d ON d.device_id = r.device_id WHERE r.code = $1',
+    [claimed.rows[0].referred_by]
+  );
+  if (referrer.rows.length === 0 || referrer.rows[0].status === 'banned') return;
+  const base = Math.max(new Date(referrer.rows[0].expires).getTime(), Date.now());
+  const newExp = new Date(base + referralBonusDays() * 24 * 3600 * 1000);
+  await pool.query('UPDATE devices SET expires = $1 WHERE device_id = $2', [newExp, referrer.rows[0].device_id]);
+}
+
+app.post('/api/referral/me', async (req, res) => {
+  const { device_id } = req.body;
+  if (!isValidDeviceId(device_id)) return res.status(400).json({ ok: false, message: "Нет ID" });
+  try {
+    if (!(await deviceExists(device_id))) return res.json({ ok: false, message: "Сначала активируйте доступ" });
+    const ref = await ensureReferralCode(device_id);
+    const stats = await pool.query(
+      'SELECT COUNT(*) AS invited, COUNT(*) FILTER (WHERE rewarded) AS rewarded FROM referrals WHERE referred_by = $1',
+      [ref.code]
+    );
+    return res.json({
+      ok: true,
+      code: ref.code,
+      referred_by: ref.referred_by,
+      invited: parseInt(stats.rows[0].invited, 10),
+      rewarded: parseInt(stats.rows[0].rewarded, 10),
+      bonus_days: referralBonusDays()
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, message: "Ошибка базы данных" });
+  }
+});
+
+app.post('/api/referral/apply', async (req, res) => {
+  const { device_id, code } = req.body;
+  if (!isValidDeviceId(device_id) || typeof code !== 'string') {
+    return res.status(400).json({ ok: false, message: "Введите код" });
+  }
+  const cleanCode = code.trim().toUpperCase();
+  if (!/^[A-Z0-9]{4,12}$/.test(cleanCode)) return res.json({ ok: false, message: "Код не найден" });
+
+  try {
+    if (!(await deviceExists(device_id))) return res.json({ ok: false, message: "Сначала активируйте доступ" });
+    const own = await ensureReferralCode(device_id);
+    if (own.referred_by) return res.json({ ok: false, message: "Код друга уже введён" });
+    if (own.code === cleanCode) return res.json({ ok: false, message: "Нельзя ввести свой собственный код" });
+
+    const referrer = await pool.query('SELECT 1 FROM referrals WHERE code = $1', [cleanCode]);
+    if (referrer.rows.length === 0) return res.json({ ok: false, message: "Код не найден" });
+
+    const updated = await pool.query(
+      'UPDATE referrals SET referred_by = $1 WHERE device_id = $2 AND referred_by IS NULL RETURNING 1',
+      [cleanCode, device_id]
+    );
+    if (updated.rows.length === 0) return res.json({ ok: false, message: "Код друга уже введён" });
+    return res.json({ ok: true, message: `Код принят! Когда купите ключ, другу начислится +${referralBonusDays()} дн.` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, message: "Ошибка базы данных" });
+  }
+});
+
 // 1. Запрос триала на 3 дня — один раз на устройство, по времени сервера
 app.post('/api/request-trial', async (req, res) => {
   const { device_id } = req.body;
@@ -200,6 +318,15 @@ app.post('/api/activate-device', async (req, res) => {
           device_info = COALESCE($7, devices.device_info)
     `, [device_id, cleanKey, expireDate, new Date(), 'active', keyData.type, deviceInfo]);
 
+    // Тестовые ключи на секунды/часы бонус пригласившему не дают.
+    if (keyData.duration_hours >= 24) {
+      try {
+        await rewardReferrer(device_id);
+      } catch (err) {
+        console.error('Referral reward error:', err);
+      }
+    }
+
     return res.json({
       valid: true,
       force_lock: false,
@@ -257,6 +384,19 @@ app.get('/admin/view-devices', async (req, res) => {
     const devicesQuery = await pool.query('SELECT * FROM devices');
     const keysQuery = await pool.query('SELECT * FROM app_keys');
     const trialsQuery = await pool.query('SELECT COUNT(*) FROM trial_history');
+    const referralsQuery = await pool.query('SELECT device_id, code, referred_by, rewarded FROM referrals');
+
+    const refByDevice = new Map(referralsQuery.rows.map(r => [r.device_id, r]));
+    const invitedByCode = new Map();
+    let referredDevices = 0;
+    for (const r of referralsQuery.rows) {
+      if (!r.referred_by) continue;
+      referredDevices++;
+      const s = invitedByCode.get(r.referred_by) || { invited: 0, paid: 0 };
+      s.invited++;
+      if (r.rewarded) s.paid++;
+      invitedByCode.set(r.referred_by, s);
+    }
 
     const now = Date.now();
     let totalDevices = 0, onlineDevices = 0, activeSubs = 0, expiredSubs = 0, bannedDevices = 0;
@@ -284,6 +424,17 @@ app.get('/admin/view-devices', async (req, res) => {
       // «Отключить» — только у тех, у кого подписка сейчас работает.
       const canDisable = !isBanned && !isDisabled && !isExpired;
 
+      const ref = refByDevice.get(dev.device_id);
+      const refParts = [];
+      if (ref) {
+        const s = invitedByCode.get(ref.code) || { invited: 0, paid: 0 };
+        refParts.push(`реф. код <b>${escapeHtml(ref.code)}</b> · пригласил ${s.invited} (купили ${s.paid})`);
+        if (ref.referred_by) refParts.push(`пришёл по коду ${escapeHtml(ref.referred_by)}`);
+      }
+      const refHtml = refParts.length
+        ? `<div style="font-size:12px;color:#4a5568;margin-top:3px;">${refParts.join(' · ')}</div>`
+        : '';
+
       const expDate = new Date(dev.expires);
       const formattedDate = expDate.toLocaleString('ru-RU', {
         day: '2-digit', month: '2-digit', year: 'numeric',
@@ -297,6 +448,7 @@ app.get('/admin/view-devices', async (req, res) => {
           <td>
             <div style="font-weight:600;">${dev.device_info ? escapeHtml(dev.device_info) : '<span style="color:#a0aec0;">— старая версия приложения</span>'}</div>
             <code style="background:#feebc8;color:#c05621;padding:2px 6px;border-radius:4px;font-size:12px;">${escapeHtml(dev.device_id)}</code>
+            ${refHtml}
           </td>
           <td>${escapeHtml(formattedDate)}</td>
           <td style="white-space:nowrap;">
@@ -351,6 +503,7 @@ app.get('/admin/view-devices', async (req, res) => {
             <div class="stat-box"><div>⏳ Истекли</div><div class="stat-num" style="color:#718096;">${expiredSubs}</div></div>
             <div class="stat-box"><div>🚫 В бане</div><div class="stat-num" style="color:#e53e3e;">${bannedDevices}</div></div>
             <div class="stat-box"><div>🎁 Взяли триал</div><div class="stat-num">${escapeHtml(trialsQuery.rows[0].count)}</div></div>
+            <div class="stat-box"><div>🤝 По рефералке</div><div class="stat-num">${referredDevices}</div></div>
           </div>
         </div>
         <div class="card">
