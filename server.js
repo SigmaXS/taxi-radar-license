@@ -131,8 +131,8 @@ function referralBonusDays() {
   return Number.isFinite(days) && days > 0 ? days : 3;
 }
 
-// Контакты и ссылка на группу для приложения. Меняются переменными в Railway
-// без выпуска новой версии; пустое значение прячет кнопку в приложении.
+// Контакты, ссылка на группу и ключ карты для приложения. Меняются переменными
+// в Railway без выпуска новой версии; пустое значение прячет кнопку в приложении.
 app.get('/api/app-config', (req, res) => {
   const phone = process.env.CONTACT_PHONE ?? '+37378293919';
   res.json({
@@ -140,7 +140,9 @@ app.get('/api/app-config', (req, res) => {
     whatsapp: process.env.CONTACT_WHATSAPP ?? phone,
     viber: process.env.CONTACT_VIBER ?? phone,
     phone,
-    group_url: process.env.GROUP_URL || '',
+    group_url: process.env.GROUP_URL ?? 'https://t.me/taxi_radar_chisinau',
+    // Ключ Яндекс Tiles API для карты спроса (бесплатный, общий на всех).
+    tiles_api_key: process.env.TILES_API_KEY || '',
     referral_bonus_days: referralBonusDays()
   });
 });
