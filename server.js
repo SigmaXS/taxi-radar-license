@@ -1,30 +1,20 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+// API вызывает Android-приложение, а не браузер, — CORS нужен только ему.
+app.use('/api', cors());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
 });
 
-const INITIAL_KEYS = {
-  "TEST-10SEC-DEMO": { durationHours: 10 / 3600, type: "Тест 10 секунд" },
-  "VIP3-7K92-M8X4": { durationHours: 720, type: "301 дней" },
-  "VIP3-3B19-TX85": { durationHours: 720, type: "30 дней" },
-  "VIP3-5F71-L2W9": { durationHours: 720, type: "30 дней" },
-  "VIP3-8C44-P9K3": { durationHours: 720, type: "30 дней" },
-  "VIP3-2V67-Q1Z8": { durationHours: 720, type: "30 дней" },
-  "VIP3-9D83-X5H2": { durationHours: 720, type: "30 дней" },
-  "VIP3-4N52-J7C6": { durationHours: 720, type: "30 дней" },
-  "VIP3-6G18-K4B7": { durationHours: 720, type: "30 дней" },
-  "VIP3-1A95-W3D8": { durationHours: 720, type: "30 дней" },
-  "VIP3-7M36-S8V2": { durationHours: 720, type: "30 дней" }
-};
+const TRIAL_HOURS = 72;
 
 async function initDB() {
   try {
@@ -47,17 +37,6 @@ async function initDB() {
         device_id VARCHAR(100) PRIMARY KEY
       );
     `);
-
-    // Заполняем дефолтные ключи, если таблица пустая
-    const res = await pool.query('SELECT COUNT(*) FROM app_keys');
-    if (parseInt(res.rows[0].count) === 0) {
-      for (const [k, val] of Object.entries(INITIAL_KEYS)) {
-        await pool.query(
-          'INSERT INTO app_keys (key_code, duration_hours, type, created) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-          [k, val.durationHours, val.type, new Date()]
-        );
-      }
-    }
     console.log("Database initialized successfully.");
   } catch (err) {
     console.error("DB init error:", err);
@@ -69,17 +48,72 @@ initDB();
 function generateCode(prefix = "VIP3") {
   const chars = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
   let r1 = "", r2 = "";
-  for (let i = 0; i < 4; i++) r1 += chars[Math.floor(Math.random() * chars.length)];
-  for (let i = 0; i < 4; i++) r2 += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 4; i++) r1 += chars[crypto.randomInt(chars.length)];
+  for (let i = 0; i < 4; i++) r2 += chars[crypto.randomInt(chars.length)];
   return `${prefix}-${r1}-${r2}`;
 }
 
-app.get('/', (req, res) => res.redirect('/admin/view-devices'));
+// ANDROID_ID — 16 hex-символов; допускаем чуть шире, но без спецсимволов,
+// чтобы ID нельзя было использовать для внедрения HTML в админку.
+function isValidDeviceId(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(id);
+}
 
-// 1. Запрос триала на 3 дня
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// Вход в админку — логин/пароль из переменных Railway (ADMIN_USER, ADMIN_PASSWORD).
+// Без ADMIN_PASSWORD админка закрыта полностью, а не открыта для всех.
+function requireAdmin(req, res, next) {
+  const password = process.env.ADMIN_PASSWORD;
+  if (!password) {
+    return res.status(503).send('Админка отключена: задайте переменную ADMIN_PASSWORD в Railway.');
+  }
+  const user = process.env.ADMIN_USER || 'admin';
+
+  const header = req.headers.authorization || '';
+  const [scheme, encoded] = header.split(' ');
+  if (scheme === 'Basic' && encoded) {
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const sep = decoded.indexOf(':');
+    if (sep !== -1 && safeEqual(decoded.slice(0, sep), user) && safeEqual(decoded.slice(sep + 1), password)) {
+      // Браузер сам подставляет сохранённый пароль и в запросы с чужих сайтов —
+      // поэтому действия (POST) принимаем только со страниц самой админки.
+      if (req.method !== 'GET') {
+        const origin = req.headers.origin || req.headers.referer;
+        if (origin) {
+          let originHost = null;
+          try { originHost = new URL(origin).host; } catch (e) { /* некорректный заголовок */ }
+          if (originHost !== req.headers.host) return res.status(403).send('Запрещено');
+        }
+      }
+      return next();
+    }
+  }
+  res.set('WWW-Authenticate', 'Basic realm="Taxi Radar admin", charset="UTF-8"');
+  return res.status(401).send('Требуется вход');
+}
+
+app.use('/admin', requireAdmin);
+
+app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
+
+// 1. Запрос триала на 3 дня — один раз на устройство, по времени сервера
 app.post('/api/request-trial', async (req, res) => {
   const { device_id } = req.body;
-  if (!device_id) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
+  if (!isValidDeviceId(device_id)) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
 
   try {
     const devQuery = await pool.query('SELECT * FROM devices WHERE device_id = $1', [device_id]);
@@ -100,7 +134,7 @@ app.post('/api/request-trial', async (req, res) => {
       return res.json({ valid: false, force_lock: true, message: "Пробный период на этом устройстве уже был использован. Введите ключ." });
     }
 
-    const expireDate = new Date(Date.now() + 72 * 3600 * 1000);
+    const expireDate = new Date(Date.now() + TRIAL_HOURS * 3600 * 1000);
     const trialKey = generateCode("TR3D");
 
     await pool.query(
@@ -124,7 +158,7 @@ app.post('/api/request-trial', async (req, res) => {
 // 2. Активация ключа
 app.post('/api/activate-device', async (req, res) => {
   const { key, device_id } = req.body;
-  if (!key || !device_id) {
+  if (typeof key !== 'string' || !key.trim() || !isValidDeviceId(device_id)) {
     return res.status(400).json({ valid: false, force_lock: true, message: "Введите ключ и ID" });
   }
 
@@ -136,7 +170,9 @@ app.post('/api/activate-device', async (req, res) => {
       return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство в бане!" });
     }
 
-    const keyQuery = await pool.query('SELECT * FROM app_keys WHERE key_code = $1', [cleanKey]);
+    // Удаляем ключ в том же запросе, что и читаем: два устройства не смогут
+    // активировать один ключ одновременно.
+    const keyQuery = await pool.query('DELETE FROM app_keys WHERE key_code = $1 RETURNING *', [cleanKey]);
     if (keyQuery.rows.length === 0) {
       return res.json({ valid: false, force_lock: true, message: "Неверный ключ или уже активирован" });
     }
@@ -147,11 +183,9 @@ app.post('/api/activate-device', async (req, res) => {
     await pool.query(`
       INSERT INTO devices (device_id, key_code, expires, last_seen, status, type)
       VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (device_id) DO UPDATE 
+      ON CONFLICT (device_id) DO UPDATE
       SET key_code = $2, expires = $3, last_seen = $4, status = $5, type = $6
     `, [device_id, cleanKey, expireDate, new Date(), 'active', keyData.type]);
-
-    await pool.query('DELETE FROM app_keys WHERE key_code = $1', [cleanKey]);
 
     return res.json({
       valid: true,
@@ -165,10 +199,10 @@ app.post('/api/activate-device', async (req, res) => {
   }
 });
 
-// 3. Фоновая проверка
+// 3. Проверка при входе в приложение и фоновая — по времени сервера
 app.post('/api/check-license', async (req, res) => {
   const { device_id } = req.body;
-  if (!device_id) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
+  if (!isValidDeviceId(device_id)) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
 
   try {
     const devQuery = await pool.query('SELECT * FROM devices WHERE device_id = $1', [device_id]);
@@ -198,7 +232,7 @@ app.post('/api/check-license', async (req, res) => {
   }
 });
 
-// Админ-панель
+// Админ-панель (закрыта паролем — см. requireAdmin)
 app.get('/admin/view-devices', async (req, res) => {
   try {
     const devicesQuery = await pool.query('SELECT * FROM devices');
@@ -229,12 +263,12 @@ app.get('/admin/view-devices', async (req, res) => {
       return `
         <tr>
           <td>${isBanned ? '<span style="color:#e53e3e;font-weight:bold;">● В бане</span>' : (isExpired ? '<span style="color:#718096;">● Истек</span>' : (isOnline ? '<span style="color:#38a169;font-weight:bold;">● Онлайн</span>' : '<span style="color:#a0aec0;">● Оффлайн</span>'))}</td>
-          <td style="font-weight:bold;">${dev.key_code}</td>
-          <td><code style="background:#feebc8;color:#c05621;padding:3px 6px;border-radius:4px;">${dev.device_id}</code></td>
-          <td>${formattedDate}</td>
+          <td style="font-weight:bold;">${escapeHtml(dev.key_code)}</td>
+          <td><code style="background:#feebc8;color:#c05621;padding:3px 6px;border-radius:4px;">${escapeHtml(dev.device_id)}</code></td>
+          <td>${escapeHtml(formattedDate)}</td>
           <td>
             <form method="POST" action="/admin/action" style="display:inline;">
-              <input type="hidden" name="device_id" value="${dev.device_id}">
+              <input type="hidden" name="device_id" value="${escapeHtml(dev.device_id)}">
               <button name="action" value="reset" style="background:#3182ce;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">+30 дней</button>
               ${isBanned ? '<button name="action" value="unban" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">Разбанить</button>' : '<button name="action" value="ban" style="background:#e53e3e;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">В БАН</button>'}
               <button name="action" value="unlink" style="background:#dd6b20;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Удалить</button>
@@ -246,7 +280,11 @@ app.get('/admin/view-devices', async (req, res) => {
 
     const freeKeysList = keysQuery.rows.map(k => `
       <div style="background:#f7fafc; padding:8px 12px; margin:5px 0; border-radius:6px; display:flex; justify-content:space-between; align-items:center; border:1px solid #e2e8f0;">
-        <div><strong style="color:#2b6cb0;">${k.key_code}</strong> <span style="font-size:12px; color:#718096;">(${k.type})</span></div>
+        <div><strong style="color:#2b6cb0;">${escapeHtml(k.key_code)}</strong> <span style="font-size:12px; color:#718096;">(${escapeHtml(k.type)})</span></div>
+        <form method="POST" action="/admin/delete-key" style="margin:0;">
+          <input type="hidden" name="key_code" value="${escapeHtml(k.key_code)}">
+          <button style="background:#e53e3e;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;">Удалить</button>
+        </form>
       </div>
     `).join('');
 
@@ -278,7 +316,7 @@ app.get('/admin/view-devices', async (req, res) => {
             <div class="stat-box"><div>✅ Активных</div><div class="stat-num" style="color:#3182ce;">${activeSubs}</div></div>
             <div class="stat-box"><div>⏳ Истекли</div><div class="stat-num" style="color:#718096;">${expiredSubs}</div></div>
             <div class="stat-box"><div>🚫 В бане</div><div class="stat-num" style="color:#e53e3e;">${bannedDevices}</div></div>
-            <div class="stat-box"><div>🎁 Взяли триал</div><div class="stat-num">${trialsQuery.rows[0].count}</div></div>
+            <div class="stat-box"><div>🎁 Взяли триал</div><div class="stat-num">${escapeHtml(trialsQuery.rows[0].count)}</div></div>
           </div>
         </div>
         <div class="card">
@@ -328,6 +366,16 @@ app.post('/admin/generate', async (req, res) => {
       'INSERT INTO app_keys (key_code, duration_hours, type, created) VALUES ($1, $2, $3, $4)',
       [newKey, hours, label, new Date()]
     );
+  } catch (err) {
+    console.error(err);
+  }
+  res.redirect('/admin/view-devices');
+});
+
+app.post('/admin/delete-key', async (req, res) => {
+  const { key_code } = req.body;
+  try {
+    await pool.query('DELETE FROM app_keys WHERE key_code = $1', [key_code]);
   } catch (err) {
     console.error(err);
   }
