@@ -383,7 +383,7 @@ app.post('/api/check-license', async (req, res) => {
 // Админ-панель (закрыта паролем — см. requireAdmin)
 app.get('/admin/view-devices', async (req, res) => {
   try {
-    const devicesQuery = await pool.query('SELECT * FROM devices');
+    const devicesQuery = await pool.query('SELECT * FROM devices ORDER BY last_seen DESC NULLS LAST');
     const keysQuery = await pool.query('SELECT * FROM app_keys');
     const trialsQuery = await pool.query('SELECT COUNT(*) FROM trial_history');
     const referralsQuery = await pool.query('SELECT device_id, code, referred_by, rewarded FROM referrals');
@@ -446,7 +446,7 @@ app.get('/admin/view-devices', async (req, res) => {
       return `
         <tr>
           <td style="white-space:nowrap;">${statusHtml}</td>
-          <td style="font-weight:bold;">${escapeHtml(dev.key_code)}</td>
+          <td><div style="font-weight:bold;">${escapeHtml(dev.key_code)}</div><div style="font-size:12px;color:#718096;">${escapeHtml(dev.type || '')}</div></td>
           <td>
             <div style="font-weight:600;">${dev.device_info ? escapeHtml(dev.device_info) : '<span style="color:#a0aec0;">— старая версия приложения</span>'}</div>
             <code style="background:#feebc8;color:#c05621;padding:2px 6px;border-radius:4px;font-size:12px;">${escapeHtml(dev.device_id)}</code>
