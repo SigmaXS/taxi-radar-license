@@ -36,6 +36,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS trial_history (
         device_id VARCHAR(100) PRIMARY KEY
       );
+      ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_info VARCHAR(150);
     `);
     console.log("Database initialized successfully.");
   } catch (err) {
@@ -57,6 +58,14 @@ function generateCode(prefix = "VIP3") {
 // чтобы ID нельзя было использовать для внедрения HTML в админку.
 function isValidDeviceId(id) {
   return typeof id === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(id);
+}
+
+// Модель телефона от приложения («Xiaomi M2007J3SG · Android 12 · v1.2»).
+// Старые версии приложения её не присылают — тогда null и прежнее значение не трогаем.
+function cleanDeviceInfo(value) {
+  if (typeof value !== 'string') return null;
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 150);
+  return cleaned || null;
 }
 
 function escapeHtml(value) {
@@ -114,11 +123,13 @@ app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
 app.post('/api/request-trial', async (req, res) => {
   const { device_id } = req.body;
   if (!isValidDeviceId(device_id)) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
+  const deviceInfo = cleanDeviceInfo(req.body.device_info);
 
   try {
     const devQuery = await pool.query('SELECT * FROM devices WHERE device_id = $1', [device_id]);
     if (devQuery.rows.length > 0) {
       const dev = devQuery.rows[0];
+      await pool.query('UPDATE devices SET device_info = COALESCE($1, device_info) WHERE device_id = $2', [deviceInfo, device_id]);
       if (dev.status === 'banned') {
         return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано (БАН)!" });
       }
@@ -138,8 +149,8 @@ app.post('/api/request-trial', async (req, res) => {
     const trialKey = generateCode("TR3D");
 
     await pool.query(
-      'INSERT INTO devices (device_id, key_code, expires, last_seen, status, type) VALUES ($1, $2, $3, $4, $5, $6)',
-      [device_id, trialKey, expireDate, new Date(), 'active', 'Пробный (3 дня)']
+      'INSERT INTO devices (device_id, key_code, expires, last_seen, status, type, device_info) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [device_id, trialKey, expireDate, new Date(), 'active', 'Пробный (3 дня)', deviceInfo]
     );
     await pool.query('INSERT INTO trial_history (device_id) VALUES ($1) ON CONFLICT DO NOTHING', [device_id]);
 
@@ -163,6 +174,7 @@ app.post('/api/activate-device', async (req, res) => {
   }
 
   const cleanKey = key.trim().toUpperCase();
+  const deviceInfo = cleanDeviceInfo(req.body.device_info);
 
   try {
     const devCheck = await pool.query('SELECT * FROM devices WHERE device_id = $1', [device_id]);
@@ -181,11 +193,12 @@ app.post('/api/activate-device', async (req, res) => {
     const expireDate = new Date(Date.now() + Math.round(keyData.duration_hours * 3600 * 1000));
 
     await pool.query(`
-      INSERT INTO devices (device_id, key_code, expires, last_seen, status, type)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO devices (device_id, key_code, expires, last_seen, status, type, device_info)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       ON CONFLICT (device_id) DO UPDATE
-      SET key_code = $2, expires = $3, last_seen = $4, status = $5, type = $6
-    `, [device_id, cleanKey, expireDate, new Date(), 'active', keyData.type]);
+      SET key_code = $2, expires = $3, last_seen = $4, status = $5, type = $6,
+          device_info = COALESCE($7, devices.device_info)
+    `, [device_id, cleanKey, expireDate, new Date(), 'active', keyData.type, deviceInfo]);
 
     return res.json({
       valid: true,
@@ -211,18 +224,24 @@ app.post('/api/check-license', async (req, res) => {
     }
     const dev = devQuery.rows[0];
 
+    const serverNow = new Date();
+    await pool.query(
+      'UPDATE devices SET last_seen = $1, device_info = COALESCE($2, device_info) WHERE device_id = $3',
+      [serverNow, cleanDeviceInfo(req.body.device_info), device_id]
+    );
+
     if (dev.status === 'banned') {
       return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано" });
     }
+    if (dev.status === 'disabled') {
+      return res.json({ valid: false, force_lock: true, is_banned: false, message: "Подписка отключена. Введите ключ." });
+    }
 
-    const serverNow = new Date();
     const expireDate = new Date(dev.expires);
 
     if (serverNow > expireDate) {
       return res.json({ valid: false, force_lock: true, is_banned: false, message: "Срок действия подписки истек" });
     }
-
-    await pool.query('UPDATE devices SET last_seen = $1 WHERE device_id = $2', [serverNow, device_id]);
 
     const diffHours = Math.max(0, Math.round((expireDate - serverNow) / 3600000));
     return res.json({ valid: true, force_lock: false, expires: dev.expires, hours_left: diffHours });
@@ -245,14 +264,25 @@ app.get('/admin/view-devices', async (req, res) => {
     const devicesList = devicesQuery.rows.map(dev => {
       totalDevices++;
       const isBanned = dev.status === 'banned';
+      const isDisabled = dev.status === 'disabled';
       const isExpired = new Date(dev.expires).getTime() < now;
       const lastSeenDiffMin = Math.round((now - new Date(dev.last_seen).getTime()) / 60000);
-      const isOnline = lastSeenDiffMin <= 5 && !isBanned && !isExpired;
+      const isOnline = lastSeenDiffMin <= 5 && !isBanned && !isDisabled && !isExpired;
 
       if (isBanned) bannedDevices++;
-      else if (isExpired) expiredSubs++;
+      else if (isDisabled || isExpired) expiredSubs++;
       else activeSubs++;
       if (isOnline) onlineDevices++;
+
+      let statusHtml;
+      if (isBanned) statusHtml = '<span style="color:#e53e3e;font-weight:bold;">● В бане</span>';
+      else if (isDisabled) statusHtml = '<span style="color:#dd6b20;font-weight:bold;">● Отключён</span>';
+      else if (isExpired) statusHtml = '<span style="color:#718096;">● Истек</span>';
+      else if (isOnline) statusHtml = '<span style="color:#38a169;font-weight:bold;">● Онлайн</span>';
+      else statusHtml = '<span style="color:#a0aec0;">● Оффлайн</span>';
+
+      // «Отключить» — только у тех, у кого подписка сейчас работает.
+      const canDisable = !isBanned && !isDisabled && !isExpired;
 
       const expDate = new Date(dev.expires);
       const formattedDate = expDate.toLocaleString('ru-RU', {
@@ -262,14 +292,18 @@ app.get('/admin/view-devices', async (req, res) => {
 
       return `
         <tr>
-          <td>${isBanned ? '<span style="color:#e53e3e;font-weight:bold;">● В бане</span>' : (isExpired ? '<span style="color:#718096;">● Истек</span>' : (isOnline ? '<span style="color:#38a169;font-weight:bold;">● Онлайн</span>' : '<span style="color:#a0aec0;">● Оффлайн</span>'))}</td>
+          <td style="white-space:nowrap;">${statusHtml}</td>
           <td style="font-weight:bold;">${escapeHtml(dev.key_code)}</td>
-          <td><code style="background:#feebc8;color:#c05621;padding:3px 6px;border-radius:4px;">${escapeHtml(dev.device_id)}</code></td>
-          <td>${escapeHtml(formattedDate)}</td>
           <td>
+            <div style="font-weight:600;">${dev.device_info ? escapeHtml(dev.device_info) : '<span style="color:#a0aec0;">— старая версия приложения</span>'}</div>
+            <code style="background:#feebc8;color:#c05621;padding:2px 6px;border-radius:4px;font-size:12px;">${escapeHtml(dev.device_id)}</code>
+          </td>
+          <td>${escapeHtml(formattedDate)}</td>
+          <td style="white-space:nowrap;">
             <form method="POST" action="/admin/action" style="display:inline;">
               <input type="hidden" name="device_id" value="${escapeHtml(dev.device_id)}">
               <button name="action" value="reset" style="background:#3182ce;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">+30 дней</button>
+              ${canDisable ? '<button name="action" value="disable" onclick="return confirm(\'Отключить подписку у этого устройства?\')" style="background:#718096;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Отключить</button>' : ''}
               ${isBanned ? '<button name="action" value="unban" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">Разбанить</button>' : '<button name="action" value="ban" style="background:#e53e3e;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">В БАН</button>'}
               <button name="action" value="unlink" style="background:#dd6b20;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Удалить</button>
             </form>
@@ -296,7 +330,7 @@ app.get('/admin/view-devices', async (req, res) => {
         <title>Аналитика и управление лицензиями</title>
         <style>
           body { font-family: sans-serif; background: #f0f2f5; padding: 25px; margin: 0; }
-          .card { background: #fff; border-radius: 10px; padding: 20px; max-width: 1000px; margin: 0 auto 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+          .card { background: #fff; border-radius: 10px; padding: 20px; max-width: 1150px; margin: 0 auto 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
           .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 10px; }
           .stat-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; text-align: center; }
           .stat-num { font-size: 24px; font-weight: bold; color: #2b6cb0; margin-top: 5px; }
@@ -336,7 +370,7 @@ app.get('/admin/view-devices', async (req, res) => {
           <h2>🔑 Устройства в базе</h2>
           <table>
             <thead>
-              <tr><th>Статус</th><th>Ключ</th><th>ID Устройства</th><th>Истекает</th><th>Действие</th></tr>
+              <tr><th>Статус</th><th>Ключ</th><th>Телефон / ID</th><th>Истекает</th><th>Действие</th></tr>
             </thead>
             <tbody>
               ${devicesList || '<tr><td colspan="5" align="center">Нет устройств</td></tr>'}
@@ -389,6 +423,9 @@ app.post('/admin/action', async (req, res) => {
       await pool.query("UPDATE devices SET status = 'banned' WHERE device_id = $1", [device_id]);
     } else if (action === 'unban') {
       await pool.query("UPDATE devices SET status = 'active', expires = CASE WHEN expires < NOW() THEN NOW() + INTERVAL '1 day' ELSE expires END WHERE device_id = $1", [device_id]);
+    } else if (action === 'disable') {
+      // Снимаем подписку, но не баним: новым ключом устройство может вернуться.
+      await pool.query("UPDATE devices SET status = 'disabled', expires = $1 WHERE device_id = $2", [new Date(), device_id]);
     } else if (action === 'unlink') {
       await pool.query("DELETE FROM devices WHERE device_id = $1", [device_id]);
     } else if (action === 'reset') {
