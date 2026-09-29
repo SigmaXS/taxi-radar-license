@@ -40,6 +40,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       muted BOOLEAN NOT NULL DEFAULT false,
       created TIMESTAMP NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE chat_users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
     CREATE TABLE IF NOT EXISTS chat_messages (
       id BIGSERIAL PRIMARY KEY,
       device_id VARCHAR(100) NOT NULL,
@@ -144,23 +145,51 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     const after = parseInt(req.body.after, 10);
     const rows = Number.isFinite(after) && after > 0
       ? (await pool.query(
-        `SELECT id, device_id, nickname, text, created FROM chat_messages
-         WHERE id > $1 AND NOT deleted ORDER BY id LIMIT 100`, [after])).rows
+        `SELECT m.id, m.device_id, m.nickname, m.text, m.created, COALESCE(u.is_admin, false) AS admin
+         FROM chat_messages m LEFT JOIN chat_users u ON u.device_id = m.device_id
+         WHERE m.id > $1 AND NOT m.deleted ORDER BY m.id LIMIT 100`, [after])).rows
       : (await pool.query(
-        `SELECT * FROM (SELECT id, device_id, nickname, text, created FROM chat_messages
-         WHERE NOT deleted ORDER BY id DESC LIMIT 50) t ORDER BY id`)).rows;
-    const me = (await pool.query('SELECT nickname, muted FROM chat_users WHERE device_id = $1', [deviceId])).rows[0];
+        `SELECT * FROM (SELECT m.id, m.device_id, m.nickname, m.text, m.created, COALESCE(u.is_admin, false) AS admin
+         FROM chat_messages m LEFT JOIN chat_users u ON u.device_id = m.device_id
+         WHERE NOT m.deleted ORDER BY m.id DESC LIMIT 50) t ORDER BY id`)).rows;
+    const me = (await pool.query('SELECT nickname, muted, is_admin FROM chat_users WHERE device_id = $1', [deviceId])).rows[0];
+    // Удалённые админом сообщения приложение должно убрать у себя.
+    const deleted = Number.isFinite(after) && after > 0
+      ? (await pool.query(
+        `SELECT id FROM chat_messages WHERE deleted AND id > $1 - 200`, [after])).rows.map(r => Number(r.id))
+      : [];
     res.json({
       ok: true,
-      me: me ? { nickname: me.nickname, muted: me.muted } : null,
+      me: me ? { nickname: me.nickname, muted: me.muted, admin: me.is_admin } : null,
+      deleted,
       messages: rows.map(m => ({
         id: Number(m.id),
         nickname: m.nickname,
         text: m.text,
         ts: new Date(m.created).toISOString(),
-        mine: m.device_id === deviceId
+        mine: m.device_id === deviceId,
+        admin: m.admin === true
       }))
     });
+  }));
+
+  // Админ чата прямо из приложения: удалить сообщение или заглушить автора.
+  app.post('/api/chat/moderate', member(async (req, res, deviceId) => {
+    const me = (await pool.query('SELECT is_admin FROM chat_users WHERE device_id = $1', [deviceId])).rows[0];
+    if (!me || !me.is_admin) return res.json({ ok: false, message: 'Только для админа' });
+    const id = parseInt(req.body.id, 10);
+    const msg = (await pool.query('SELECT device_id FROM chat_messages WHERE id = $1', [id])).rows[0];
+    if (!msg) return res.json({ ok: false, message: 'Сообщение не найдено' });
+    if (req.body.action === 'delete') {
+      await pool.query('UPDATE chat_messages SET deleted = true WHERE id = $1', [id]);
+    } else if (req.body.action === 'mute') {
+      if (msg.device_id === deviceId) return res.json({ ok: false, message: 'Себя заглушить нельзя' });
+      await pool.query('UPDATE chat_users SET muted = true WHERE device_id = $1', [msg.device_id]);
+      await pool.query('UPDATE chat_messages SET deleted = true WHERE device_id = $1', [msg.device_id]);
+    } else {
+      return res.json({ ok: false, message: 'Неизвестное действие' });
+    }
+    res.json({ ok: true });
   }));
 
   app.post('/api/chat/send', member(async (req, res, deviceId) => {
@@ -201,7 +230,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   async function clientSummary(hash, deviceId) {
     const rows = (await pool.query(
       `SELECT tag, COUNT(DISTINCT device_id) AS drivers,
-              BOOL_OR(device_id = $2) AS mine
+              BOOL_OR(device_id = $2) AS mine,
+              BOOL_OR(device_id = 'admin') AS by_admin
        FROM client_tags
        WHERE phone_hash = $1 AND created > NOW() - ($3 || ' days')::INTERVAL
        GROUP BY tag`,
@@ -213,7 +243,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       const def = CLIENT_TAGS[r.tag];
       if (!def) continue;
       const drivers = Number(r.drivers);
-      if (!def.negative || drivers >= NEGATIVE_MIN_DRIVERS) tags[r.tag] = drivers;
+      // Отметку админа показываем сразу — он проверил клиента сам.
+      if (!def.negative || drivers >= NEGATIVE_MIN_DRIVERS || r.by_admin) tags[r.tag] = drivers;
       if (r.mine) mine.push(r.tag);
     }
     return { tags, mine };
@@ -368,7 +399,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   app.get('/admin/community', async (req, res) => {
     try {
       const messages = (await pool.query(
-        `SELECT m.id, m.device_id, m.nickname, m.text, m.created, m.deleted, u.muted
+        `SELECT m.id, m.device_id, m.nickname, m.text, m.created, m.deleted, u.muted, u.is_admin
          FROM chat_messages m LEFT JOIN chat_users u ON u.device_id = m.device_id
          ORDER BY m.id DESC LIMIT 100`
       )).rows;
@@ -388,13 +419,16 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       const chatRows = messages.map(m => `
         <tr style="${m.deleted ? 'opacity:.4' : ''}">
           <td style="white-space:nowrap;">${escapeHtml(fmt(m.created))}</td>
-          <td><b>${escapeHtml(m.nickname)}</b>${m.muted ? ' <span style="color:#e53e3e;">(заглушён)</span>' : ''}<br><code style="font-size:11px;">${escapeHtml(m.device_id)}</code></td>
+          <td><b>${escapeHtml(m.nickname)}</b>${m.is_admin ? ' <span style="color:#d69e2e;">★ админ</span>' : ''}${m.muted ? ' <span style="color:#e53e3e;">(заглушён)</span>' : ''}<br><code style="font-size:11px;">${escapeHtml(m.device_id)}</code></td>
           <td>${escapeHtml(m.text)}</td>
           <td style="white-space:nowrap;">
             <form method="POST" action="/admin/community/chat" style="display:inline;">
               <input type="hidden" name="id" value="${escapeHtml(m.id)}">
               <input type="hidden" name="device_id" value="${escapeHtml(m.device_id)}">
               ${m.deleted ? '' : `<button name="action" value="delete" style="${btn}background:#718096;">Удалить</button>`}
+              ${m.is_admin
+                ? `<button name="action" value="unadmin" style="${btn}background:#718096;">Снять админа</button>`
+                : `<button name="action" value="admin" style="${btn}background:#d69e2e;" onclick="return confirm('Сделать этого водителя админом чата?')">Сделать админом</button>`}
               ${m.muted
                 ? `<button name="action" value="unmute" style="${btn}background:#38a169;">Разрешить писать</button>`
                 : `<button name="action" value="mute" style="${btn}background:#e53e3e;" onclick="return confirm('Запретить этому водителю писать в чат?')">Заглушить</button>`}
@@ -438,6 +472,14 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
             <button name="action" value="clear" style="${btn}background:#e53e3e;" onclick="return confirm('Удалить все отметки этого номера?')">Очистить номер</button>
           </form>
           <form method="POST" action="/admin/community/client" style="margin-top:10px;">
+            <input type="text" name="phone" placeholder="+37378123456 или 078123456">
+            <select name="tag" style="padding:6px;">
+              ${Object.entries(CLIENT_TAGS).map(([k, v]) => `<option value="${k}">${escapeHtml(v.label)}</option>`).join('')}
+            </select>
+            <button name="action" value="tag" style="${btn}background:#d69e2e;">Добавить метку от админа</button>
+            <div style="font-size:12px;color:#718096;margin-top:4px;">Метка от админа видна водителям сразу, без правила «минимум 2 водителя». Удобно проверить на своём номере.</div>
+          </form>
+          <form method="POST" action="/admin/community/client" style="margin-top:10px;">
             <input type="text" name="device_id" placeholder="ID устройства водителя">
             <button name="action" value="clear_device" style="${btn}background:#e53e3e;" onclick="return confirm('Удалить все отметки, которые поставил этот водитель?')">Удалить все его отметки</button>
           </form>
@@ -461,6 +503,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       if (action === 'delete') await pool.query('UPDATE chat_messages SET deleted = true WHERE id = $1', [parseInt(id, 10)]);
       if (action === 'mute') await pool.query('UPDATE chat_users SET muted = true WHERE device_id = $1', [device_id]);
       if (action === 'unmute') await pool.query('UPDATE chat_users SET muted = false WHERE device_id = $1', [device_id]);
+      if (action === 'admin') await pool.query('UPDATE chat_users SET is_admin = true, muted = false WHERE device_id = $1', [device_id]);
+      if (action === 'unadmin') await pool.query('UPDATE chat_users SET is_admin = false WHERE device_id = $1', [device_id]);
     } catch (err) {
       console.error(err);
     }
@@ -489,6 +533,17 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         const phone = cleanPhone(/^0\d{8}$/.test(local) ? '+373' + local.slice(1) : local);
         if (!phone) {
           msg = 'Неверный номер';
+        } else if (action === 'tag') {
+          if (!CLIENT_TAGS[req.body.tag]) {
+            msg = 'Неизвестная метка';
+          } else {
+            await pool.query(
+              `INSERT INTO client_tags (phone_hash, device_id, tag) VALUES ($1, 'admin', $2)
+               ON CONFLICT (phone_hash, device_id, tag) DO UPDATE SET created = NOW()`,
+              [phoneHash(phone), req.body.tag]
+            );
+            msg = `Добавлено: ${CLIENT_TAGS[req.body.tag].label}`;
+          }
         } else if (action === 'clear') {
           const r = await pool.query('DELETE FROM client_tags WHERE phone_hash = $1', [phoneHash(phone)]);
           msg = `Удалено отметок: ${r.rowCount}`;
