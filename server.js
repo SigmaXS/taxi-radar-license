@@ -498,6 +498,7 @@ app.get('/admin/view-devices', async (req, res) => {
       <body>
         <div class="card">
           <h2>📊 Аналитика и Статистика (PostgreSQL)</h2>
+          <p><a href="/admin/community">💬 Чат, клиенты, метки на карте, аэропорт →</a></p>
           <div class="stats-grid">
             <div class="stat-box"><div>Всего устройств</div><div class="stat-num">${totalDevices}</div></div>
             <div class="stat-box"><div>⚡ Онлайн сейчас</div><div class="stat-num" style="color:#38a169;">${onlineDevices}</div></div>
@@ -592,6 +593,9 @@ app.post('/admin/action', async (req, res) => {
   }
   res.redirect('/admin/view-devices');
 });
+
+// Чат, отметки о клиентах, метки на дороге, аэропорт — см. community.js.
+require('./community')(app, pool, { isValidDeviceId, escapeHtml });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT} with PostgreSQL`));
