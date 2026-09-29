@@ -160,8 +160,9 @@ module.exports = function airportBoard() {
 
   // Для проверки: настроены ли ключи и что ответили сервисы (без ключей и рейсов).
   function status() {
-    const pick = s => ({ configured: s.configured, updated: s.updated, count: s.count, error: s.error });
-    return { aviationstack: pick(av), airlabs: { ...pick(al), plan: al.plan } };
+    // «configured» — есть ли ключ в Railway прямо сейчас, даже если табло ещё никто не открывал.
+    const pick = (s, keyName) => ({ configured: Boolean((process.env[keyName] || '').trim()), updated: s.updated, count: s.count, error: s.error });
+    return { aviationstack: pick(av, 'AVIATIONSTACK_KEY'), airlabs: { ...pick(al, 'AIRLABS_KEY'), plan: al.plan } };
   }
 
   return { flights, status };
