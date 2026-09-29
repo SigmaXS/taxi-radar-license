@@ -494,7 +494,6 @@ app.get('/admin/view-devices', async (req, res) => {
               <input type="hidden" name="device_id" value="${escapeHtml(dev.device_id)}">
               <input type="number" name="days" min="1" max="3650" placeholder="дней" style="width:62px;padding:4px;">
               <button name="action" value="add_days" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">+ Добавить</button>
-              <button name="action" value="reset" style="background:#3182ce;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">+30 дней</button>
               ${canDisable ? '<button name="action" value="disable" onclick="return confirm(\'Отключить подписку у этого устройства?\')" style="background:#718096;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Отключить</button>' : ''}
               ${isBanned ? '<button name="action" value="unban" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">Разбанить</button>' : '<button name="action" value="ban" style="background:#e53e3e;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">В БАН</button>'}
               <button name="action" value="unlink" style="background:#dd6b20;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Удалить</button>
@@ -551,10 +550,11 @@ app.get('/admin/view-devices', async (req, res) => {
         <div class="card">
           <h2>🛠 Создать ключ</h2>
           <div class="btn-group">
-            <form method="POST" action="/admin/generate"><button name="type" value="sub_10s" class="gen-btn" style="background:#e53e3e;">⚡ Тест 10 сек</button></form>
-            <form method="POST" action="/admin/generate"><button name="type" value="sub_1d" class="gen-btn" style="background:#38a169;">+ 1 день</button></form>
-            <form method="POST" action="/admin/generate"><button name="type" value="sub_7d" class="gen-btn" style="background:#38a169;">+ 7 дней</button></form>
-            <form method="POST" action="/admin/generate"><button name="type" value="sub_30d" class="gen-btn" style="background:#2f855a;">+ 30 дней</button></form>
+            <form method="POST" action="/admin/generate" style="display:flex;gap:8px;align-items:center;">
+              <input type="number" name="days" min="1" max="3650" placeholder="дней" required style="width:80px;padding:7px;">
+              <button name="type" value="days" class="gen-btn" style="background:#38a169;">Создать ключ</button>
+            </form>
+            <form method="POST" action="/admin/generate"><button name="type" value="sub_1m" class="gen-btn" style="background:#e53e3e;">⚡ Тест 1 минута</button></form>
           </div>
           <h3 style="margin-top:20px; font-size:16px;">Свободные ключи (${keysQuery.rows.length}):</h3>
           <div style="max-height: 150px; overflow-y: auto;">
@@ -595,13 +595,20 @@ app.get('/admin/view-devices', async (req, res) => {
 
 app.post('/admin/generate', async (req, res) => {
   const { type } = req.body;
-  let hours = 720, label = "30 дней";
-  if (type === 'sub_10s') { hours = 10 / 3600; label = "Тест 10 секунд"; }
-  else if (type === 'sub_1d') { hours = 24; label = "1 день"; }
-  else if (type === 'sub_7d') { hours = 168; label = "7 дней"; }
-  else if (type === 'sub_30d') { hours = 720; label = "30 дней"; }
+  let hours, label;
+  if (type === 'sub_1m') {
+    hours = 1 / 60;
+    label = "Тест 1 минута";
+  } else {
+    const days = parseInt(req.body.days, 10);
+    if (!(days >= 1 && days <= 3650)) {
+      return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Введите число дней от 1 до 3650'));
+    }
+    hours = days * 24;
+    label = `${days} дн.`;
+  }
 
-  const newKey = generateCode(type === 'sub_10s' ? "TEST" : "VIP3");
+  const newKey = generateCode(type === 'sub_1m' ? "TEST" : "VIP3");
   try {
     await pool.query(
       'INSERT INTO app_keys (key_code, duration_hours, type, created) VALUES ($1, $2, $3, $4)',
@@ -647,13 +654,7 @@ app.post('/admin/action', async (req, res) => {
          WHERE device_id = $2 RETURNING expires`,
         [String(days), device_id]
       );
-      const msg = r.rows.length
-        ? `+${days} дн. для ${device_id}: теперь до ${new Date(r.rows[0].expires).toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau' })}`
-        : 'Устройство не найдено';
-      return res.redirect('/admin/view-devices?msg=' + encodeURIComponent(msg));
-    } else if (action === 'reset') {
-      const newExp = new Date(Date.now() + 720 * 3600 * 1000);
-      await pool.query("UPDATE devices SET status = 'active', expires = $1 WHERE device_id = $2", [newExp, device_id]);
+      if (!r.rows.length) return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Устройство не найдено'));
     }
   } catch (err) {
     console.error(err);
