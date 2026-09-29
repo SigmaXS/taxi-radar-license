@@ -365,13 +365,17 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   // Ключ — переменная AIRLABS_KEY в Railway; без неё табло просто пустое.
   // Новый код RMO у AirLabs может быть ещё не заведён — пробуем варианты
   // и запоминаем тот, что вернул рейсы.
-  const AIRPORT_QUERIES = ['arr_icao=LUKK', 'arr_iata=KIV', 'arr_iata=RMO'];
+  const AIRPORT_QUERIES = [
+    'schedules?arr_icao=LUKK', 'schedules?arr_iata=KIV', 'schedules?arr_iata=RMO',
+    // Запасной вариант: самолёты, которые сейчас летят в Кишинёв.
+    'flights?arr_icao=LUKK', 'flights?arr_iata=RMO', 'flights?arr_iata=KIV'
+  ];
   let airportQuery = null;
   const FLIGHTS_EVERY_MS = 60 * 60 * 1000;
   app.locals.airportFlights = [];
 
   // Для диагностики: настроен ли ключ, когда обновлялись, что ответил AirLabs.
-  const board = { configured: false, updated: null, count: 0, error: null, query: null };
+  const board = { configured: false, updated: null, count: 0, error: null, query: null, attempts: [], plan: null };
 
   async function refreshFlights() {
     const key = (process.env.AIRLABS_KEY || '').trim();
@@ -379,10 +383,14 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     if (!key) return;
     try {
       let list = [];
+      board.attempts = [];
       for (const q of airportQuery ? [airportQuery] : AIRPORT_QUERIES) {
-        const r = await fetch(`https://airlabs.co/api/v9/schedules?${q}&api_key=${encodeURIComponent(key)}`);
+        const r = await fetch(`https://airlabs.co/api/v9/${q}&api_key=${encodeURIComponent(key)}`);
         const json = await r.json();
         board.updated = new Date().toISOString();
+        const keyInfo = json.request && json.request.key;
+        if (keyInfo && typeof keyInfo.type === 'string') board.plan = keyInfo.type;
+        board.attempts.push({ q, n: Array.isArray(json.response) ? json.response.length : null });
         if (json.error) {
           board.error = String(json.error.message || json.error.code || 'error').slice(0, 200);
           console.error('Airport flights API error:', board.error);
@@ -401,7 +409,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           flight: f.flight_iata || f.flight_icao || '',
           from: f.dep_iata || '',
           // Время местное, «2026-09-29 14:30».
-          time: f.arr_time || '',
+          // /flights отдаёт не расписание, а самолёты в воздухе — время прилёта может не прийти.
+          time: f.arr_time || f.arr_estimated || '',
           estimated: f.arr_estimated || f.arr_actual || '',
           status: f.status || ''
         }))
