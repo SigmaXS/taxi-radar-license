@@ -361,31 +361,41 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
 
   // Сайт аэропорта отдаёт табло зашифрованным и закрыт от скачивания — не
   // взламываем. Берём прилёты в Кишинёв (RMO) у AirLabs: бесплатный ключ,
-  // 1000 запросов в месяц. Раз в 45 минут ≈ 960 в месяц — укладываемся.
+  // 1000 запросов в месяц. Раз в час ≈ 720 в месяц — укладываемся.
   // Ключ — переменная AIRLABS_KEY в Railway; без неё табло просто пустое.
-  const AIRPORT_IATA = 'RMO';
-  const FLIGHTS_EVERY_MS = 45 * 60 * 1000;
+  // Новый код RMO у AirLabs может быть ещё не заведён — пробуем варианты
+  // и запоминаем тот, что вернул рейсы.
+  const AIRPORT_QUERIES = ['arr_icao=LUKK', 'arr_iata=KIV', 'arr_iata=RMO'];
+  let airportQuery = null;
+  const FLIGHTS_EVERY_MS = 60 * 60 * 1000;
   app.locals.airportFlights = [];
 
   // Для диагностики: настроен ли ключ, когда обновлялись, что ответил AirLabs.
-  const board = { configured: false, updated: null, count: 0, error: null };
+  const board = { configured: false, updated: null, count: 0, error: null, query: null };
 
   async function refreshFlights() {
     const key = (process.env.AIRLABS_KEY || '').trim();
     board.configured = Boolean(key);
     if (!key) return;
     try {
-      const url = `https://airlabs.co/api/v9/schedules?arr_iata=${AIRPORT_IATA}&api_key=${encodeURIComponent(key)}`;
-      const r = await fetch(url);
-      const json = await r.json();
-      board.updated = new Date().toISOString();
-      if (json.error) {
-        board.error = String(json.error.message || json.error.code || 'error').slice(0, 200);
-        console.error('Airport flights API error:', board.error);
-        return;
+      let list = [];
+      for (const q of airportQuery ? [airportQuery] : AIRPORT_QUERIES) {
+        const r = await fetch(`https://airlabs.co/api/v9/schedules?${q}&api_key=${encodeURIComponent(key)}`);
+        const json = await r.json();
+        board.updated = new Date().toISOString();
+        if (json.error) {
+          board.error = String(json.error.message || json.error.code || 'error').slice(0, 200);
+          console.error('Airport flights API error:', board.error);
+          return;
+        }
+        board.error = null;
+        list = Array.isArray(json.response) ? json.response : [];
+        if (list.length) {
+          airportQuery = q;
+          board.query = q;
+          break;
+        }
       }
-      board.error = null;
-      const list = Array.isArray(json.response) ? json.response : [];
       app.locals.airportFlights = list
         .map(f => ({
           flight: f.flight_iata || f.flight_icao || '',
