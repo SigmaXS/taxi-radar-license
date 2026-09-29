@@ -357,6 +357,43 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true, queue: Number(q.rows[0].n), flights: app.locals.airportFlights || [] });
   }));
 
+  // ---------- табло прилётов ----------
+
+  // Сайт аэропорта отдаёт табло зашифрованным и закрыт от скачивания — не
+  // взламываем. Берём прилёты в Кишинёв (RMO) у AirLabs: бесплатный ключ,
+  // 1000 запросов в месяц. Раз в 45 минут ≈ 960 в месяц — укладываемся.
+  // Ключ — переменная AIRLABS_KEY в Railway; без неё табло просто пустое.
+  const AIRPORT_IATA = 'RMO';
+  const FLIGHTS_EVERY_MS = 45 * 60 * 1000;
+  app.locals.airportFlights = [];
+
+  async function refreshFlights() {
+    const key = process.env.AIRLABS_KEY;
+    if (!key) return;
+    try {
+      const url = `https://airlabs.co/api/v9/schedules?arr_iata=${AIRPORT_IATA}&api_key=${encodeURIComponent(key)}`;
+      const r = await fetch(url);
+      const json = await r.json();
+      const list = Array.isArray(json.response) ? json.response : [];
+      app.locals.airportFlights = list
+        .map(f => ({
+          flight: f.flight_iata || f.flight_icao || '',
+          from: f.dep_iata || '',
+          // Время местное, «2026-09-29 14:30».
+          time: f.arr_time || '',
+          estimated: f.arr_estimated || f.arr_actual || '',
+          status: f.status || ''
+        }))
+        .filter(f => f.time)
+        .sort((a, b) => a.time.localeCompare(b.time));
+      console.log(`Airport flights refreshed: ${app.locals.airportFlights.length}`);
+    } catch (err) {
+      console.error('Airport flights error:', err.message);
+    }
+  }
+  refreshFlights();
+  setInterval(refreshFlights, FLIGHTS_EVERY_MS);
+
   // ---------- админка ----------
 
   app.get('/admin/community', async (req, res) => {
