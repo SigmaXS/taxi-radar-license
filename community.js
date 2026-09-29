@@ -354,25 +354,27 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       `SELECT COUNT(*) AS n FROM airport_presence WHERE last_seen > NOW() - ($1 || ' minutes')::INTERVAL`,
       [String(AIRPORT_QUEUE_MINUTES)]
     );
-    res.json({ ok: true, queue: Number(q.rows[0].n), flights: app.locals.airportFlights || [] });
+    res.json({ ok: true, queue: Number(q.rows[0].n), flights: (await flightsForStatus()) || [] });
   }));
 
   // ---------- табло прилётов ----------
 
   // Сайт аэропорта отдаёт табло зашифрованным и закрыт от скачивания — не
   // взламываем. Берём прилёты в Кишинёв (RMO) у AirLabs: бесплатный ключ,
-  // 1000 запросов в месяц. Раз в 45 минут ≈ 960 в месяц — укладываемся.
-  // На бесплатном тарифе расписания Кишинёва нет — берём самолёты в воздухе.
+  // 1000 запросов в месяц — укладываемся (см. FLIGHTS_CACHE_MS ниже).
   // Ключ — переменная AIRLABS_KEY в Railway; без неё табло просто пустое.
   // Новый код RMO у AirLabs может быть ещё не заведён — пробуем варианты
   // и запоминаем тот, что вернул рейсы.
-  const AIRPORT_QUERIES = [
-    'schedules?arr_icao=LUKK', 'schedules?arr_iata=KIV', 'schedules?arr_iata=RMO',
-    // Запасной вариант: самолёты, которые сейчас летят в Кишинёв.
-    'flights?arr_icao=LUKK', 'flights?arr_iata=RMO', 'flights?arr_iata=KIV'
-  ];
+  // На бесплатном тарифе расписания (schedules) Кишинёва нет — сразу берём
+  // самолёты, которые летят в Кишинёв: 1 запрос на обновление. На платном
+  // тарифе можно поставить первым 'schedules?arr_icao=LUKK'.
+  const AIRPORT_QUERIES = ['flights?arr_icao=LUKK'];
   let airportQuery = null;
-  const FLIGHTS_EVERY_MS = 45 * 60 * 1000;
+  // Обновляем, только когда кто-то открыл «Аэропорт», и не чаще раза в 45
+  // минут; ночью (01:00–05:00) не обновляем. Худший случай ≈ 830 в месяц.
+  const FLIGHTS_CACHE_MS = 45 * 60 * 1000;
+  let flightsFetchedAt = 0;
+  let flightsInFlight = null;
   const RMO_LAT = 46.9277, RMO_LON = 28.9313;
 
   function kmBetween(lat1, lon1, lat2, lon2) {
@@ -453,8 +455,27 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
 
   // Открыто: только состояние, без ключа и без самих рейсов.
   app.get('/api/airport/board-status', (req, res) => res.json(board));
-  refreshFlights();
-  setInterval(refreshFlights, FLIGHTS_EVERY_MS);
+  function nightInChisinau() {
+    const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Chisinau', hour: '2-digit', hour12: false })
+      .format(new Date()));
+    return hour >= 1 && hour < 5;
+  }
+
+  // Свежее табло по запросу водителя; один запрос к AirLabs на всех.
+  async function flightsForStatus() {
+    board.configured = Boolean((process.env.AIRLABS_KEY || '').trim());
+    const stale = Date.now() - flightsFetchedAt > FLIGHTS_CACHE_MS;
+    if (board.configured && stale && !nightInChisinau()) {
+      if (!flightsInFlight) {
+        flightsInFlight = refreshFlights().finally(() => {
+          flightsFetchedAt = Date.now();
+          flightsInFlight = null;
+        });
+      }
+      await flightsInFlight;
+    }
+    return app.locals.airportFlights;
+  }
 
   // ---------- админка ----------
 
