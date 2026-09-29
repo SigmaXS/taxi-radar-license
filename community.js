@@ -367,13 +367,24 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   const FLIGHTS_EVERY_MS = 45 * 60 * 1000;
   app.locals.airportFlights = [];
 
+  // Для диагностики: настроен ли ключ, когда обновлялись, что ответил AirLabs.
+  const board = { configured: false, updated: null, count: 0, error: null };
+
   async function refreshFlights() {
-    const key = process.env.AIRLABS_KEY;
+    const key = (process.env.AIRLABS_KEY || '').trim();
+    board.configured = Boolean(key);
     if (!key) return;
     try {
       const url = `https://airlabs.co/api/v9/schedules?arr_iata=${AIRPORT_IATA}&api_key=${encodeURIComponent(key)}`;
       const r = await fetch(url);
       const json = await r.json();
+      board.updated = new Date().toISOString();
+      if (json.error) {
+        board.error = String(json.error.message || json.error.code || 'error').slice(0, 200);
+        console.error('Airport flights API error:', board.error);
+        return;
+      }
+      board.error = null;
       const list = Array.isArray(json.response) ? json.response : [];
       app.locals.airportFlights = list
         .map(f => ({
@@ -386,11 +397,16 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         }))
         .filter(f => f.time)
         .sort((a, b) => a.time.localeCompare(b.time));
-      console.log(`Airport flights refreshed: ${app.locals.airportFlights.length}`);
+      board.count = app.locals.airportFlights.length;
+      console.log(`Airport flights refreshed: ${board.count}`);
     } catch (err) {
+      board.error = String(err.message).slice(0, 200);
       console.error('Airport flights error:', err.message);
     }
   }
+
+  // Открыто: только состояние, без ключа и без самих рейсов.
+  app.get('/api/airport/board-status', (req, res) => res.json(board));
   refreshFlights();
   setInterval(refreshFlights, FLIGHTS_EVERY_MS);
 
