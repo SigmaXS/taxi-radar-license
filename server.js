@@ -492,6 +492,8 @@ app.get('/admin/view-devices', async (req, res) => {
           <td style="white-space:nowrap;">
             <form method="POST" action="/admin/action" style="display:inline;">
               <input type="hidden" name="device_id" value="${escapeHtml(dev.device_id)}">
+              <input type="number" name="days" min="1" max="3650" placeholder="дней" style="width:62px;padding:4px;">
+              <button name="action" value="add_days" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">+ Добавить</button>
               <button name="action" value="reset" style="background:#3182ce;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">+30 дней</button>
               ${canDisable ? '<button name="action" value="disable" onclick="return confirm(\'Отключить подписку у этого устройства?\')" style="background:#718096;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Отключить</button>' : ''}
               ${isBanned ? '<button name="action" value="unban" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">Разбанить</button>' : '<button name="action" value="ban" style="background:#e53e3e;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">В БАН</button>'}
@@ -534,6 +536,7 @@ app.get('/admin/view-devices', async (req, res) => {
       <body>
         <div class="card">
           <h2>📊 Аналитика и Статистика (PostgreSQL)</h2>
+          ${req.query.msg ? `<p style="font-weight:bold;background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
           <p><a href="/admin/community">💬 Чат, клиенты, метки на карте, аэропорт →</a></p>
           <div class="stats-grid">
             <div class="stat-box"><div>Всего устройств</div><div class="stat-num">${totalDevices}</div></div>
@@ -561,7 +564,6 @@ app.get('/admin/view-devices', async (req, res) => {
         <div class="card">
           <h2>🔁 Перенос подписки на новую версию</h2>
           <p style="font-size:13px;color:#4a5568;">С версии 1.9 тот же телефон приходит с новым ID. Перенос отдаёт новому ID срок и тариф старого (если он длиннее), ник и админку в чате, приглашения и отметки; старая строка удаляется.</p>
-          ${req.query.msg ? `<p style="background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
           ${pairRows ? `<h3 style="font-size:15px;">Похоже на один и тот же телефон:</h3>
           <table><thead><tr><th>Телефон</th><th>Старый ID (до 1.9)</th><th>Новый ID</th><th></th></tr></thead><tbody>${pairRows}</tbody></table>` : '<p style="color:#718096;">Подсказок нет: пар «старая версия → новая» с той же моделью не найдено.</p>'}
           <form method="POST" action="/admin/transfer" style="margin-top:12px;">
@@ -633,6 +635,22 @@ app.post('/admin/action', async (req, res) => {
       await pool.query("UPDATE devices SET status = 'disabled', expires = $1 WHERE device_id = $2", [new Date(), device_id]);
     } else if (action === 'unlink') {
       await pool.query("DELETE FROM devices WHERE device_id = $1", [device_id]);
+    } else if (action === 'add_days') {
+      // +N дней к текущему сроку; если подписка уже кончилась — от сегодня. Бан не снимаем.
+      const days = parseInt(req.body.days, 10);
+      if (!(days >= 1 && days <= 3650)) {
+        return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Введите число дней от 1 до 3650'));
+      }
+      const r = await pool.query(
+        `UPDATE devices SET expires = GREATEST(expires, NOW()) + ($1 || ' days')::INTERVAL,
+           status = CASE WHEN status = 'banned' THEN status ELSE 'active' END
+         WHERE device_id = $2 RETURNING expires`,
+        [String(days), device_id]
+      );
+      const msg = r.rows.length
+        ? `+${days} дн. для ${device_id}: теперь до ${new Date(r.rows[0].expires).toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau' })}`
+        : 'Устройство не найдено';
+      return res.redirect('/admin/view-devices?msg=' + encodeURIComponent(msg));
     } else if (action === 'reset') {
       const newExp = new Date(Date.now() + 720 * 3600 * 1000);
       await pool.query("UPDATE devices SET status = 'active', expires = $1 WHERE device_id = $2", [newExp, device_id]);
