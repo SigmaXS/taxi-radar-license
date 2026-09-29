@@ -57,6 +57,13 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       created TIMESTAMP NOT NULL DEFAULT NOW(),
       PRIMARY KEY (phone_hash, device_id, tag)
     );
+    CREATE TABLE IF NOT EXISTS client_reviews (
+      phone_hash CHAR(64) NOT NULL,
+      device_id VARCHAR(100) NOT NULL,
+      text VARCHAR(200) NOT NULL,
+      created TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (phone_hash, device_id)
+    );
     CREATE TABLE IF NOT EXISTS road_reports (
       id BIGSERIAL PRIMARY KEY,
       device_id VARCHAR(100) NOT NULL,
@@ -265,7 +272,24 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       if (!def.negative || drivers >= NEGATIVE_MIN_DRIVERS || r.by_admin) tags[r.tag] = drivers;
       if (r.mine) mine.push(r.tag);
     }
-    return { tags, mine };
+    // Отзывы своими словами: по одному от водителя, свежие сверху.
+    const reviews = (await pool.query(
+      `SELECT text, created, device_id = $2 AS mine, device_id = 'admin' AS admin
+       FROM client_reviews
+       WHERE phone_hash = $1 AND created > NOW() - ($3 || ' days')::INTERVAL
+       ORDER BY created DESC LIMIT 10`,
+      [hash, deviceId, String(CLIENT_TAG_DAYS)]
+    )).rows.map(r => ({ text: r.text, ts: r.created, mine: r.mine, admin: r.admin }));
+    return { tags, mine, reviews };
+  }
+
+  // В отзыве не должно быть чужих номеров и ссылок — только слова о поездке.
+  function cleanReview(value) {
+    return cleanText(value, 200)
+      .replace(/https?:\/\/\S+|www\.\S+|t\.me\/\S+/gi, '…')
+      .replace(/\+?\d[\d\s()-]{6,}\d/g, '…')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   app.post('/api/clients/check', member(async (req, res, deviceId) => {
@@ -295,6 +319,27 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         `INSERT INTO client_tags (phone_hash, device_id, tag) VALUES ($1, $2, $3)
          ON CONFLICT (phone_hash, device_id, tag) DO UPDATE SET created = NOW()`,
         [hash, deviceId, tag]
+      );
+    }
+    res.json({ ok: true, ...(await clientSummary(hash, deviceId)) });
+  }));
+
+  // Свой отзыв о клиенте; пустой текст — удалить свой отзыв.
+  app.post('/api/clients/review', member(async (req, res, deviceId) => {
+    const phone = cleanPhone(req.body.phone);
+    if (!phone) return res.json({ ok: false, message: 'Неверный номер' });
+    const hash = phoneHash(phone);
+    const text = cleanReview(req.body.text);
+    if (!text) {
+      await pool.query('DELETE FROM client_reviews WHERE phone_hash = $1 AND device_id = $2', [hash, deviceId]);
+    } else {
+      if (tooOften('review:' + deviceId, 20, 24 * 3600 * 1000)) {
+        return res.json({ ok: false, message: 'Не больше 20 отзывов в сутки' });
+      }
+      await pool.query(
+        `INSERT INTO client_reviews (phone_hash, device_id, text) VALUES ($1, $2, $3)
+         ON CONFLICT (phone_hash, device_id) DO UPDATE SET text = $3, created = NOW()`,
+        [hash, deviceId, text]
       );
     }
     res.json({ ok: true, ...(await clientSummary(hash, deviceId)) });
@@ -589,6 +634,22 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           </td>
         </tr>`).join('');
 
+      const reviews = (await pool.query(
+        `SELECT phone_hash, device_id, text, created FROM client_reviews ORDER BY created DESC LIMIT 30`
+      )).rows;
+      const reviewRows = reviews.map(r => `
+        <tr>
+          <td style="white-space:nowrap;">${escapeHtml(fmt(r.created))}</td>
+          <td>${escapeHtml(r.text)}</td>
+          <td><code style="font-size:11px;">${escapeHtml(r.device_id)}</code></td>
+          <td>
+            <form method="POST" action="/admin/community/review" style="display:inline;">
+              <input type="hidden" name="phone_hash" value="${escapeHtml(r.phone_hash)}">
+              <input type="hidden" name="device_id" value="${escapeHtml(r.device_id)}">
+              <button style="${btn}background:#e53e3e;">Удалить</button>
+            </form>
+          </td>
+        </tr>`).join('');
       const tagRows = tagStats.map(t => `<li>${escapeHtml((CLIENT_TAGS[t.tag] || {}).label || t.tag)}: ${t.n} отметок, ${t.phones} номеров</li>`).join('');
       const notice = req.query.msg ? `<p style="background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : '';
 
@@ -636,6 +697,10 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
             <input type="text" name="device_id" placeholder="ID устройства водителя">
             <button name="action" value="clear_device" style="${btn}background:#e53e3e;" onclick="return confirm('Удалить все отметки, которые поставил этот водитель?')">Удалить все его отметки</button>
           </form>
+        </div>
+        <div class="card"><h2>✍ Отзывы о клиентах (последние 30)</h2>
+          <p style="font-size:13px;color:#4a5568;">Водители видят отзыв сразу. Удаляйте оскорбления, личные данные и всё, что не о поездке.</p>
+          <table><tr><th>Когда</th><th>Отзыв</th><th>Кто</th><th></th></tr>${reviewRows || '<tr><td colspan="4">Отзывов пока нет</td></tr>'}</table>
         </div>
         <div class="card"><h2>🗺 Метки на дороге (активные: ${reports.length})</h2>
           <table><tr><th>Тип</th><th>Где</th><th>Поставлена</th><th>До</th><th>Кто</th><th></th></tr>${reportRows || '<tr><td colspan="6">Нет активных меток</td></tr>'}</table>
@@ -695,6 +760,15 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.redirect('/admin/community' + (msg ? '?msg=' + encodeURIComponent(msg) : ''));
   });
 
+  app.post('/admin/community/review', async (req, res) => {
+    try {
+      await pool.query('DELETE FROM client_reviews WHERE phone_hash = $1 AND device_id = $2', [req.body.phone_hash, req.body.device_id]);
+    } catch (err) {
+      console.error(err);
+    }
+    res.redirect('/admin/community?msg=' + encodeURIComponent('Отзыв удалён'));
+  });
+
   app.post('/admin/community/report', async (req, res) => {
     try {
       await pool.query('UPDATE road_reports SET expires = NOW() WHERE id = $1', [parseInt(req.body.id, 10)]);
@@ -710,7 +784,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     try {
       if (action === 'clear_device') {
         const r = await pool.query('DELETE FROM client_tags WHERE device_id = $1', [req.body.device_id]);
-        msg = `Удалено отметок: ${r.rowCount}`;
+        const rv = await pool.query('DELETE FROM client_reviews WHERE device_id = $1', [req.body.device_id]);
+        msg = `Удалено отметок: ${r.rowCount}, отзывов: ${rv.rowCount}`;
       } else {
         const local = String(req.body.phone || '').replace(/[^\d+]/g, '');
         // Как в приложении: местный номер 0XXXXXXXX — молдавский.
@@ -730,7 +805,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           }
         } else if (action === 'clear') {
           const r = await pool.query('DELETE FROM client_tags WHERE phone_hash = $1', [phoneHash(phone)]);
-          msg = `Удалено отметок: ${r.rowCount}`;
+          const rv = await pool.query('DELETE FROM client_reviews WHERE phone_hash = $1', [phoneHash(phone)]);
+          msg = `Удалено отметок: ${r.rowCount}, отзывов: ${rv.rowCount}`;
         } else {
           const rows = (await pool.query(
             'SELECT tag, COUNT(DISTINCT device_id) AS n FROM client_tags WHERE phone_hash = $1 GROUP BY tag',
@@ -739,6 +815,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           msg = rows.length
             ? rows.map(r => `${(CLIENT_TAGS[r.tag] || {}).label || r.tag}: ${r.n}`).join(', ')
             : 'Отметок нет';
+          const rv = (await pool.query('SELECT text FROM client_reviews WHERE phone_hash = $1 ORDER BY created DESC', [phoneHash(phone)])).rows;
+          if (rv.length) msg += ' · Отзывы: ' + rv.map(r => `«${r.text}»`).join(' ');
         }
       }
     } catch (err) {

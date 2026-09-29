@@ -705,6 +705,12 @@ app.post('/admin/transfer', async (req, res) => {
         [from, to]
       );
       await client.query('UPDATE client_tags SET device_id = $2 WHERE device_id = $1', [from, to]);
+      await client.query(
+        `DELETE FROM client_reviews o USING client_reviews n
+         WHERE o.device_id = $1 AND n.device_id = $2 AND n.phone_hash = o.phone_hash`,
+        [from, to]
+      );
+      await client.query('UPDATE client_reviews SET device_id = $2 WHERE device_id = $1', [from, to]);
       await client.query('UPDATE road_reports SET device_id = $2 WHERE device_id = $1', [from, to]);
       await client.query('COMMIT');
       const exp = new Date(Math.max(new Date(old.expires), new Date(cur.expires)));
