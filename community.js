@@ -354,128 +354,14 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       `SELECT COUNT(*) AS n FROM airport_presence WHERE last_seen > NOW() - ($1 || ' minutes')::INTERVAL`,
       [String(AIRPORT_QUEUE_MINUTES)]
     );
-    res.json({ ok: true, queue: Number(q.rows[0].n), flights: (await flightsForStatus()) || [] });
+    res.json({ ok: true, queue: Number(q.rows[0].n), flights: await airportBoard.flights() });
   }));
 
-  // ---------- табло прилётов ----------
+  // ---------- табло прилётов (см. airport.js) ----------
 
-  // Сайт аэропорта отдаёт табло зашифрованным и закрыт от скачивания — не
-  // взламываем. Берём прилёты в Кишинёв (RMO) у AirLabs: бесплатный ключ,
-  // 1000 запросов в месяц — укладываемся (см. FLIGHTS_CACHE_MS ниже).
-  // Ключ — переменная AIRLABS_KEY в Railway; без неё табло просто пустое.
-  // Новый код RMO у AirLabs может быть ещё не заведён — пробуем варианты
-  // и запоминаем тот, что вернул рейсы.
-  // На бесплатном тарифе расписания (schedules) Кишинёва нет — сразу берём
-  // самолёты, которые летят в Кишинёв: 1 запрос на обновление. На платном
-  // тарифе можно поставить первым 'schedules?arr_icao=LUKK'.
-  const AIRPORT_QUERIES = ['flights?arr_icao=LUKK'];
-  let airportQuery = null;
-  // Обновляем, только когда кто-то открыл «Аэропорт», и не чаще раза в 45
-  // минут; ночью (01:00–05:00) не обновляем. Худший случай ≈ 830 в месяц.
-  const FLIGHTS_CACHE_MS = 45 * 60 * 1000;
-  let flightsFetchedAt = 0;
-  let flightsInFlight = null;
-  const RMO_LAT = 46.9277, RMO_LON = 28.9313;
-
-  function kmBetween(lat1, lon1, lat2, lon2) {
-    const r = Math.PI / 180;
-    const a = Math.sin((lat2 - lat1) * r / 2) ** 2 +
-      Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin((lon2 - lon1) * r / 2) ** 2;
-    return 6371 * 2 * Math.asin(Math.sqrt(a));
-  }
-
-  // Местное время Кишинёва «2026-09-29 14:52».
-  function chisinauTime(ms) {
-    const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
-      timeZone: 'Europe/Chisinau', year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false
-    }).formatToParts(new Date(ms)).map(x => [x.type, x.value]));
-    return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
-  }
-
-  // Самолёт в воздухе: время посадки ≈ расстояние / скорость + ~8 минут на заход.
-  function etaFor(f) {
-    if (typeof f.lat !== 'number' || typeof f.lng !== 'number') return '';
-    const km = kmBetween(f.lat, f.lng, RMO_LAT, RMO_LON);
-    const speed = Math.max(Number(f.speed) || 0, 400);
-    return chisinauTime(Date.now() + (km / speed) * 3600 * 1000 + 8 * 60 * 1000);
-  }
-  app.locals.airportFlights = [];
-
-  // Для диагностики: настроен ли ключ, когда обновлялись, что ответил AirLabs.
-  const board = { configured: false, updated: null, count: 0, error: null, query: null, attempts: [], plan: null };
-
-  async function refreshFlights() {
-    const key = (process.env.AIRLABS_KEY || '').trim();
-    board.configured = Boolean(key);
-    if (!key) return;
-    try {
-      let list = [];
-      board.attempts = [];
-      for (const q of airportQuery ? [airportQuery] : AIRPORT_QUERIES) {
-        const r = await fetch(`https://airlabs.co/api/v9/${q}&api_key=${encodeURIComponent(key)}`);
-        const json = await r.json();
-        board.updated = new Date().toISOString();
-        const keyInfo = json.request && json.request.key;
-        if (keyInfo && typeof keyInfo.type === 'string') board.plan = keyInfo.type;
-        board.attempts.push({ q, n: Array.isArray(json.response) ? json.response.length : null });
-        if (json.error) {
-          board.error = String(json.error.message || json.error.code || 'error').slice(0, 200);
-          console.error('Airport flights API error:', board.error);
-          return;
-        }
-        board.error = null;
-        list = Array.isArray(json.response) ? json.response : [];
-        if (list.length) {
-          airportQuery = q;
-          board.query = q;
-          break;
-        }
-      }
-      app.locals.airportFlights = list
-        .map(f => ({
-          flight: f.flight_iata || f.flight_icao || '',
-          from: f.dep_iata || '',
-          // Время местное, «2026-09-29 14:30».
-          // /flights отдаёт не расписание, а самолёты в воздухе — время считаем сами.
-          time: f.arr_time || f.arr_estimated || etaFor(f),
-          estimated: f.arr_time ? (f.arr_estimated || f.arr_actual || '') : '',
-          approx: !f.arr_time && !f.arr_estimated,
-          status: f.status || ''
-        }))
-        .filter(f => f.time)
-        .sort((a, b) => a.time.localeCompare(b.time));
-      board.count = app.locals.airportFlights.length;
-      console.log(`Airport flights refreshed: ${board.count}`);
-    } catch (err) {
-      board.error = String(err.message).slice(0, 200);
-      console.error('Airport flights error:', err.message);
-    }
-  }
-
-  // Открыто: только состояние, без ключа и без самих рейсов.
-  app.get('/api/airport/board-status', (req, res) => res.json(board));
-  function nightInChisinau() {
-    const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Chisinau', hour: '2-digit', hour12: false })
-      .format(new Date()));
-    return hour >= 1 && hour < 5;
-  }
-
-  // Свежее табло по запросу водителя; один запрос к AirLabs на всех.
-  async function flightsForStatus() {
-    board.configured = Boolean((process.env.AIRLABS_KEY || '').trim());
-    const stale = Date.now() - flightsFetchedAt > FLIGHTS_CACHE_MS;
-    if (board.configured && stale && !nightInChisinau()) {
-      if (!flightsInFlight) {
-        flightsInFlight = refreshFlights().finally(() => {
-          flightsFetchedAt = Date.now();
-          flightsInFlight = null;
-        });
-      }
-      await flightsInFlight;
-    }
-    return app.locals.airportFlights;
-  }
+  const airportBoard = require('./airport')();
+  // Открыто: только состояние источников, без ключей и без самих рейсов.
+  app.get('/api/airport/board-status', (req, res) => res.json(airportBoard.status()));
 
   // ---------- админка ----------
 
