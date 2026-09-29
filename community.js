@@ -361,7 +361,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
 
   // Сайт аэропорта отдаёт табло зашифрованным и закрыт от скачивания — не
   // взламываем. Берём прилёты в Кишинёв (RMO) у AirLabs: бесплатный ключ,
-  // 1000 запросов в месяц. Раз в час ≈ 720 в месяц — укладываемся.
+  // 1000 запросов в месяц. Раз в 45 минут ≈ 960 в месяц — укладываемся.
+  // На бесплатном тарифе расписания Кишинёва нет — берём самолёты в воздухе.
   // Ключ — переменная AIRLABS_KEY в Railway; без неё табло просто пустое.
   // Новый код RMO у AirLabs может быть ещё не заведён — пробуем варианты
   // и запоминаем тот, что вернул рейсы.
@@ -371,7 +372,32 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     'flights?arr_icao=LUKK', 'flights?arr_iata=RMO', 'flights?arr_iata=KIV'
   ];
   let airportQuery = null;
-  const FLIGHTS_EVERY_MS = 60 * 60 * 1000;
+  const FLIGHTS_EVERY_MS = 45 * 60 * 1000;
+  const RMO_LAT = 46.9277, RMO_LON = 28.9313;
+
+  function kmBetween(lat1, lon1, lat2, lon2) {
+    const r = Math.PI / 180;
+    const a = Math.sin((lat2 - lat1) * r / 2) ** 2 +
+      Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin((lon2 - lon1) * r / 2) ** 2;
+    return 6371 * 2 * Math.asin(Math.sqrt(a));
+  }
+
+  // Местное время Кишинёва «2026-09-29 14:52».
+  function chisinauTime(ms) {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Europe/Chisinau', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false
+    }).formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+    return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+  }
+
+  // Самолёт в воздухе: время посадки ≈ расстояние / скорость + ~8 минут на заход.
+  function etaFor(f) {
+    if (typeof f.lat !== 'number' || typeof f.lng !== 'number') return '';
+    const km = kmBetween(f.lat, f.lng, RMO_LAT, RMO_LON);
+    const speed = Math.max(Number(f.speed) || 0, 400);
+    return chisinauTime(Date.now() + (km / speed) * 3600 * 1000 + 8 * 60 * 1000);
+  }
   app.locals.airportFlights = [];
 
   // Для диагностики: настроен ли ключ, когда обновлялись, что ответил AirLabs.
@@ -409,9 +435,10 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           flight: f.flight_iata || f.flight_icao || '',
           from: f.dep_iata || '',
           // Время местное, «2026-09-29 14:30».
-          // /flights отдаёт не расписание, а самолёты в воздухе — время прилёта может не прийти.
-          time: f.arr_time || f.arr_estimated || '',
-          estimated: f.arr_estimated || f.arr_actual || '',
+          // /flights отдаёт не расписание, а самолёты в воздухе — время считаем сами.
+          time: f.arr_time || f.arr_estimated || etaFor(f),
+          estimated: f.arr_time ? (f.arr_estimated || f.arr_actual || '') : '',
+          approx: !f.arr_time && !f.arr_estimated,
           status: f.status || ''
         }))
         .filter(f => f.time)
