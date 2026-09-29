@@ -394,6 +394,30 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   // Открыто: только состояние источников, без ключей и без самих рейсов.
   app.get('/api/airport/board-status', (req, res) => res.json(airportBoard.status()));
 
+  // ---------- общий геокодер (см. geocoder.js) ----------
+
+  const geocoder = require('./geocoder')(pool);
+
+  app.post('/api/geocode', member(async (req, res, deviceId) => {
+    // Одна карточка — 2–5 адресов; 200 за 10 минут хватит с запасом.
+    if (tooOften('geo:' + deviceId, 200, 10 * 60 * 1000)) {
+      return res.json({ ok: false, message: 'Слишком часто' });
+    }
+    const q = cleanText(req.body.q, 300);
+    const r = await geocoder.lookup(q);
+    if (!r) return res.json({ ok: false, message: 'Геокодер недоступен' });
+    res.json({ ok: true, ...r });
+  }));
+
+  // Открыто: счётчики без ключей и без адресов.
+  app.get('/api/geocode-status', async (req, res) => {
+    try {
+      res.json(await geocoder.status());
+    } catch (err) {
+      res.status(500).json({ error: 'status failed' });
+    }
+  });
+
   // ---------- админка ----------
 
   app.get('/admin/community', async (req, res) => {
