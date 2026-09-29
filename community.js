@@ -95,6 +95,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       real_min REAL,
       finished TIMESTAMP
     );
+    ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS note VARCHAR(40);
   `).catch(err => console.error('Community tables init error:', err));
 
   // ---------- общее ----------
@@ -466,9 +467,11 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   app.post('/api/trips/finish', member(async (req, res) => {
     const b = req.body;
     await pool.query(
-      `UPDATE trip_reports SET real_price = $2, real_km = $3, real_min = $4, finished = NOW()
+      `UPDATE trip_reports SET real_price = $2, real_km = $3, real_min = $4, note = $5, finished = NOW()
        WHERE id = $1 AND finished IS NULL AND created > NOW() - INTERVAL '6 hours'`,
-      [parseInt(b.id, 10) || 0, num(b.real_price, 1, 20000), num(b.real_km, 0, 1000), num(b.real_min, 0, 1000)]
+      // note — «маршрут менялся», «завершён не у Б»: такие поездки в среднюю ошибку не идут.
+      [parseInt(b.id, 10) || 0, num(b.real_price, 1, 20000), num(b.real_km, 0, 1000), num(b.real_min, 0, 1000),
+        cleanText(b.note, 40) || null]
     );
     res.json({ ok: true });
   }));
@@ -509,7 +512,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         `SELECT COUNT(*) AS n,
            AVG(real_price - est_price) AS avg_diff, AVG(ABS(real_price - est_price)) AS avg_abs,
            AVG(ABS(real_price - nav_price)) FILTER (WHERE nav_price IS NOT NULL) AS nav_abs
-         FROM trip_reports WHERE real_price IS NOT NULL AND created > NOW() - INTERVAL '30 days'`
+         FROM trip_reports WHERE real_price IS NOT NULL AND note IS NULL AND created > NOW() - INTERVAL '30 days'`
       )).rows[0];
       const lei = v => v == null ? '—' : `${Math.round(Number(v))} L`;
 
@@ -548,7 +551,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           <td>${lei(t.est_price)} · ${Number(t.est_km).toFixed(1)} км · ${Math.round(t.est_min)} мин</td>
           <td>${t.nav_price == null ? '—' : `${lei(t.nav_price)} · ${Number(t.nav_km).toFixed(1)} км · ${Math.round(t.nav_min)} мин`}</td>
           <td>${t.real_price == null ? (t.finished ? 'цена не распознана' : '—') : `<b>${lei(t.real_price)}</b>`}${t.real_km != null ? ` · ${Number(t.real_km).toFixed(1)} км` : ''}${t.real_min != null ? ` · ${Math.round(t.real_min)} мин` : ''}</td>
-          <td>${t.real_price == null ? '' : `${t.real_price - t.est_price > 0 ? '+' : ''}${t.real_price - t.est_price} L`}</td>
+          <td>${t.real_price == null ? '' : `${t.real_price - t.est_price > 0 ? '+' : ''}${t.real_price - t.est_price} L`}${t.note ? `<br><span style="font-size:12px;color:#dd6b20;">${escapeHtml(t.note)} — не в среднем</span>` : ''}</td>
         </tr>`).join('');
 
       const chatRows = messages.map(m => `
