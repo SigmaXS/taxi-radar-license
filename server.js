@@ -403,6 +403,40 @@ app.get('/admin/view-devices', async (req, res) => {
     }
 
     const now = Date.now();
+
+    // С версии 1.9 приложение подписано новым ключом, и Android выдаёт ему
+    // другой ANDROID_ID — тот же телефон приходит как новое устройство.
+    // Подсказываем пары: новая версия и старая с той же моделью и Android,
+    // у старой подписка длиннее.
+    const phoneOf = info => (info || '').replace(/\s*·\s*v[\d.]+\s*$/, '').trim();
+    const versionOf = info => {
+      const m = (info || '').match(/v(\d+)\.(\d+)/);
+      return m ? Number(m[1]) * 100 + Number(m[2]) : 0;
+    };
+    const signed = d => versionOf(d.device_info) >= 109;
+    const transferPairs = [];
+    for (const nd of devicesQuery.rows.filter(signed)) {
+      for (const od of devicesQuery.rows) {
+        if (od.device_id === nd.device_id || signed(od) || od.status === 'banned') continue;
+        const samePhone = od.device_info && phoneOf(od.device_info) === phoneOf(nd.device_info);
+        if (samePhone && new Date(od.expires) > new Date(nd.expires)) transferPairs.push({ from: od, to: nd });
+      }
+    }
+    const shortDate = d => new Date(d).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'Europe/Chisinau' });
+    const pairRows = transferPairs.map(p => `
+      <tr>
+        <td>${escapeHtml(phoneOf(p.to.device_info))}</td>
+        <td><code>${escapeHtml(p.from.device_id)}</code><br><span style="font-size:12px;color:#718096;">${escapeHtml(p.from.device_info || '')} · до ${escapeHtml(shortDate(p.from.expires))} · ${escapeHtml(p.from.type || '')}</span></td>
+        <td><code>${escapeHtml(p.to.device_id)}</code><br><span style="font-size:12px;color:#718096;">${escapeHtml(p.to.device_info || '')} · до ${escapeHtml(shortDate(p.to.expires))}</span></td>
+        <td>
+          <form method="POST" action="/admin/transfer" style="margin:0;">
+            <input type="hidden" name="from" value="${escapeHtml(p.from.device_id)}">
+            <input type="hidden" name="to" value="${escapeHtml(p.to.device_id)}">
+            <button onclick="return confirm('Перенести подписку, ник в чате и приглашения на новый ID? Старая строка удалится.')" style="background:#38a169;color:#fff;border:none;padding:6px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Перенести</button>
+          </form>
+        </td>
+      </tr>`).join('');
+
     let totalDevices = 0, onlineDevices = 0, activeSubs = 0, expiredSubs = 0, bannedDevices = 0;
 
     const devicesList = devicesQuery.rows.map(dev => {
@@ -525,6 +559,19 @@ app.get('/admin/view-devices', async (req, res) => {
           </div>
         </div>
         <div class="card">
+          <h2>🔁 Перенос подписки на новую версию</h2>
+          <p style="font-size:13px;color:#4a5568;">С версии 1.9 тот же телефон приходит с новым ID. Перенос отдаёт новому ID срок и тариф старого (если он длиннее), ник и админку в чате, приглашения и отметки; старая строка удаляется.</p>
+          ${req.query.msg ? `<p style="background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
+          ${pairRows ? `<h3 style="font-size:15px;">Похоже на один и тот же телефон:</h3>
+          <table><thead><tr><th>Телефон</th><th>Старый ID (до 1.9)</th><th>Новый ID</th><th></th></tr></thead><tbody>${pairRows}</tbody></table>` : '<p style="color:#718096;">Подсказок нет: пар «старая версия → новая» с той же моделью не найдено.</p>'}
+          <form method="POST" action="/admin/transfer" style="margin-top:12px;">
+            <input type="text" name="from" placeholder="Старый ID" style="padding:6px;width:220px;">
+            →
+            <input type="text" name="to" placeholder="Новый ID" style="padding:6px;width:220px;">
+            <button onclick="return confirm('Перенести подписку со старого ID на новый? Старая строка удалится.')" style="background:#3182ce;color:#fff;border:none;padding:6px 10px;border-radius:4px;cursor:pointer;">Перенести вручную</button>
+          </form>
+        </div>
+        <div class="card">
           <h2>🔑 Устройства в базе</h2>
           <table>
             <thead>
@@ -594,6 +641,83 @@ app.post('/admin/action', async (req, res) => {
     console.error(err);
   }
   res.redirect('/admin/view-devices');
+});
+
+// Перенос подписки со старого ID телефона на новый (см. «Перенос» в админке).
+// Всё в одной транзакции: либо переехало целиком, либо ничего.
+app.post('/admin/transfer', async (req, res) => {
+  const from = String(req.body.from || '').trim();
+  const to = String(req.body.to || '').trim();
+  let msg;
+  if (!isValidDeviceId(from) || !isValidDeviceId(to) || from === to) {
+    return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Нужны два разных ID'));
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const old = (await client.query('SELECT * FROM devices WHERE device_id = $1 FOR UPDATE', [from])).rows[0];
+    const cur = (await client.query('SELECT * FROM devices WHERE device_id = $1 FOR UPDATE', [to])).rows[0];
+    if (!old || !cur) {
+      msg = 'Не найден ' + (!old ? 'старый' : 'новый') + ' ID';
+      await client.query('ROLLBACK');
+    } else if (old.status === 'banned') {
+      msg = 'Старый ID в бане — не переносим';
+      await client.query('ROLLBACK');
+    } else {
+      // Срок и тариф — лучший из двух; модель телефона — от новой версии.
+      if (new Date(old.expires) > new Date(cur.expires)) {
+        await client.query(
+          `UPDATE devices SET key_code = $2, expires = $3, type = $4,
+             status = CASE WHEN status = 'banned' THEN status ELSE 'active' END
+           WHERE device_id = $1`,
+          [to, old.key_code, old.expires, old.type]
+        );
+      }
+      await client.query('DELETE FROM devices WHERE device_id = $1', [from]);
+      await client.query('INSERT INTO trial_history (device_id) VALUES ($1) ON CONFLICT DO NOTHING', [to]);
+
+      // Приглашения: старый код водитель уже раздал — оставляем его. Новый
+      // (создаётся при первом запуске) убираем, если по нему никто не пришёл.
+      const oldRef = (await client.query('SELECT * FROM referrals WHERE device_id = $1', [from])).rows[0];
+      if (oldRef) {
+        const newRef = (await client.query('SELECT * FROM referrals WHERE device_id = $1', [to])).rows[0];
+        const newUsed = newRef && (await client.query('SELECT 1 FROM referrals WHERE referred_by = $1 LIMIT 1', [newRef.code])).rows.length > 0;
+        if (!newRef || !newUsed) {
+          await client.query('DELETE FROM referrals WHERE device_id = $1', [to]);
+          await client.query(
+            'UPDATE referrals SET device_id = $2, referred_by = COALESCE(referred_by, $3) WHERE device_id = $1',
+            [from, to, newRef ? newRef.referred_by : null]
+          );
+        }
+      }
+
+      // Чат: ник, админка, заглушка и сообщения.
+      const oldChat = (await client.query('SELECT * FROM chat_users WHERE device_id = $1', [from])).rows[0];
+      if (oldChat) {
+        await client.query('DELETE FROM chat_users WHERE device_id = $1', [to]);
+        await client.query('UPDATE chat_users SET device_id = $2 WHERE device_id = $1', [from, to]);
+      }
+      await client.query('UPDATE chat_messages SET device_id = $2 WHERE device_id = $1', [from, to]);
+      // Отметки о клиентах: одинаковые у старого и нового не дублируем.
+      await client.query(
+        `DELETE FROM client_tags o USING client_tags n
+         WHERE o.device_id = $1 AND n.device_id = $2 AND n.phone_hash = o.phone_hash AND n.tag = o.tag`,
+        [from, to]
+      );
+      await client.query('UPDATE client_tags SET device_id = $2 WHERE device_id = $1', [from, to]);
+      await client.query('UPDATE road_reports SET device_id = $2 WHERE device_id = $1', [from, to]);
+      await client.query('COMMIT');
+      const exp = new Date(Math.max(new Date(old.expires), new Date(cur.expires)));
+      msg = `Перенесено на ${to}: подписка до ${exp.toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau' })}`;
+    }
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    msg = 'Ошибка переноса — ничего не изменено';
+  } finally {
+    client.release();
+  }
+  res.redirect('/admin/view-devices?msg=' + encodeURIComponent(msg));
 });
 
 // Чат, отметки о клиентах, метки на дороге, аэропорт — см. community.js.
