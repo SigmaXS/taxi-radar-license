@@ -11,6 +11,10 @@ const CENTER = { lat: 47.0105, lon: 28.8638 };
 const DAILY_LIMIT_PER_KEY = Number(process.env.GEOCODER_DAILY_LIMIT || 900);
 const FOUND_DAYS = 180;
 const NOT_FOUND_HOURS = 24;
+// Точки от водителей: адрес → где реально стоял телефон при посадке/высадке.
+// Две точки дальше этого друг от друга — кто-то нажал не там; не усредняем.
+const LEARN_AGREE_KM = 0.3;
+const MAX_FROM_CENTER_KM = 150;
 
 function haversineKm(a, b) {
   const R = 6371;
@@ -43,6 +47,20 @@ module.exports = function createGeocoder(pool) {
       lon DOUBLE PRECISION,
       created TIMESTAMP NOT NULL DEFAULT NOW(),
       hits INT NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS address_points (
+      q VARCHAR(300) PRIMARY KEY,
+      lat DOUBLE PRECISION NOT NULL,
+      lon DOUBLE PRECISION NOT NULL,
+      n INT NOT NULL DEFAULT 1,
+      source VARCHAR(8) NOT NULL,
+      updated TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS address_misses (
+      q VARCHAR(300) PRIMARY KEY,
+      text VARCHAR(300) NOT NULL,
+      n INT NOT NULL DEFAULT 1,
+      last_seen TIMESTAMP NOT NULL DEFAULT NOW()
     );
   `).catch(err => console.error('Geocode cache init error:', err));
 
@@ -117,10 +135,22 @@ module.exports = function createGeocoder(pool) {
     return null;
   }
 
-  /** { found, lat, lon } или null, если сервис сейчас недоступен. */
+  /**
+   * { found, lat, lon } или null, если сервис сейчас недоступен.
+   * Порядок: точка от админа или подтверждённая двумя поездками → база
+   * Яндекса → одна точка от водителя (если Яндекс адрес не знает).
+   */
   async function lookup(rawQuery) {
     const q = normalize(rawQuery);
     if (!q) return { found: false };
+    const own = (await pool.query('SELECT lat, lon, n, source FROM address_points WHERE q = $1', [q])).rows[0];
+    if (own && (own.source === 'admin' || own.n >= 2)) return { found: true, lat: own.lat, lon: own.lon };
+    const r = await lookupYandex(rawQuery, q);
+    if (own && (!r || !r.found)) return { found: true, lat: own.lat, lon: own.lon };
+    return r;
+  }
+
+  async function lookupYandex(rawQuery, q) {
     const cached = await pool.query(
       `SELECT lat, lon FROM geocode_cache
        WHERE q = $1 AND (
@@ -156,6 +186,79 @@ module.exports = function createGeocoder(pool) {
     }
   }
 
+  // Приложение не смогло найти адрес ни у нас, ни у Яндекса — в список для админа.
+  async function miss(rawQuery) {
+    const q = normalize(rawQuery);
+    if (!q) return;
+    await pool.query(
+      `INSERT INTO address_misses (q, text) VALUES ($1, $2)
+       ON CONFLICT (q) DO UPDATE SET n = address_misses.n + 1, last_seen = NOW()`,
+      [q, String(rawQuery).trim().slice(0, 300)]
+    );
+  }
+
+  // Телефон водителя стоял у этого адреса (посадка или высадка).
+  async function learn(rawQuery, lat, lon) {
+    const q = normalize(rawQuery);
+    if (!q || !Number.isFinite(lat) || !Number.isFinite(lon)) return 'bad';
+    if (haversineKm({ lat, lon }, CENTER) > MAX_FROM_CENTER_KM) return 'far';
+    const row = (await pool.query('SELECT lat, lon, n, source FROM address_points WHERE q = $1', [q])).rows[0];
+    if (!row) {
+      await pool.query(
+        `INSERT INTO address_points (q, lat, lon, n, source) VALUES ($1, $2, $3, 1, 'gps') ON CONFLICT (q) DO NOTHING`,
+        [q, lat, lon]
+      );
+    } else if (row.source === 'admin') {
+      return 'admin';
+    } else if (haversineKm({ lat, lon }, row) > LEARN_AGREE_KM) {
+      // Подтверждённую точку одна странная поездка не сдвигает; одиночную — заменяет свежей.
+      if (row.n >= 2) return 'conflict';
+      await pool.query(`UPDATE address_points SET lat = $2, lon = $3, n = 1, updated = NOW() WHERE q = $1`, [q, lat, lon]);
+    } else {
+      await pool.query(
+        `UPDATE address_points SET lat = (lat * n + $2) / (n + 1), lon = (lon * n + $3) / (n + 1),
+           n = LEAST(n + 1, 50), updated = NOW() WHERE q = $1`,
+        [q, lat, lon]
+      );
+    }
+    await pool.query('DELETE FROM address_misses WHERE q = $1', [q]);
+    return 'ok';
+  }
+
+  // Админ поставил точку вручную — она главнее всего остального.
+  async function setAdminPoint(rawQuery, lat, lon) {
+    const q = normalize(rawQuery);
+    await pool.query(
+      `INSERT INTO address_points (q, lat, lon, n, source) VALUES ($1, $2, $3, 1, 'admin')
+       ON CONFLICT (q) DO UPDATE SET lat = $2, lon = $3, n = 1, source = 'admin', updated = NOW()`,
+      [q, lat, lon]
+    );
+    await pool.query('DELETE FROM address_misses WHERE q = $1', [q]);
+  }
+
+  async function removePoint(rawQuery) {
+    await pool.query('DELETE FROM address_points WHERE q = $1', [normalize(rawQuery)]);
+  }
+
+  async function dismissMiss(rawQuery) {
+    await pool.query('DELETE FROM address_misses WHERE q = $1', [normalize(rawQuery)]);
+  }
+
+  // Для админки.
+  async function adminData() {
+    const misses = (await pool.query(
+      `SELECT q, text, n, last_seen FROM address_misses
+       WHERE last_seen > NOW() - INTERVAL '60 days' ORDER BY n DESC, last_seen DESC LIMIT 50`
+    )).rows;
+    const points = (await pool.query(
+      `SELECT q, lat, lon, n, source, updated FROM address_points ORDER BY updated DESC LIMIT 50`
+    )).rows;
+    const counts = (await pool.query(
+      `SELECT source, COUNT(*) AS total, COUNT(*) FILTER (WHERE n >= 2) AS confirmed FROM address_points GROUP BY source`
+    )).rows;
+    return { misses, points, counts };
+  }
+
   // Для страницы статуса: без самих ключей, только номера и счётчики.
   async function status() {
     newDay();
@@ -175,5 +278,5 @@ module.exports = function createGeocoder(pool) {
     };
   }
 
-  return { lookup, status, enabled };
+  return { lookup, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize };
 };

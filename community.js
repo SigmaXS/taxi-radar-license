@@ -78,6 +78,23 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       device_id VARCHAR(100) PRIMARY KEY,
       last_seen TIMESTAMP NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS trip_reports (
+      id BIGSERIAL PRIMARY KEY,
+      created TIMESTAMP NOT NULL DEFAULT NOW(),
+      tariff VARCHAR(20) NOT NULL,
+      stops INT NOT NULL DEFAULT 0,
+      surge INT NOT NULL DEFAULT 0,
+      est_price INT NOT NULL,
+      est_km REAL NOT NULL,
+      est_min REAL NOT NULL,
+      nav_km REAL,
+      nav_min REAL,
+      nav_price INT,
+      real_price INT,
+      real_km REAL,
+      real_min REAL,
+      finished TIMESTAMP
+    );
   `).catch(err => console.error('Community tables init error:', err));
 
   // ---------- общее ----------
@@ -409,6 +426,53 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true, ...r });
   }));
 
+  app.post('/api/geocode/miss', member(async (req, res, deviceId) => {
+    if (tooOften('miss:' + deviceId, 60, 10 * 60 * 1000)) return res.json({ ok: false });
+    await geocoder.miss(cleanText(req.body.q, 300));
+    res.json({ ok: true });
+  }));
+
+  // Точка, где водитель забрал или высадил пассажира. Кто прислал — не храним.
+  app.post('/api/geocode/learn', member(async (req, res, deviceId) => {
+    if (tooOften('learn:' + deviceId, 30, 60 * 60 * 1000)) return res.json({ ok: false });
+    const r = await geocoder.learn(cleanText(req.body.q, 300), Number(req.body.lat), Number(req.body.lon));
+    res.json({ ok: r === 'ok', result: r });
+  }));
+
+  // ---------- точность цен: наш расчёт против Яндекса ----------
+
+  const num = (v, min, max) => {
+    const x = Number(v);
+    return Number.isFinite(x) && x >= min && x <= max ? x : null;
+  };
+
+  // Поездка началась: наш расчёт с карточки и что показал навигатор Яндекса.
+  app.post('/api/trips/start', member(async (req, res, deviceId) => {
+    if (tooOften('trip:' + deviceId, 20, 60 * 60 * 1000)) return res.json({ ok: false });
+    const b = req.body;
+    const estPrice = num(b.est_price, 1, 20000);
+    if (estPrice == null) return res.json({ ok: false });
+    const r = await pool.query(
+      `INSERT INTO trip_reports (tariff, stops, surge, est_price, est_km, est_min, nav_km, nav_min, nav_price)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [cleanText(b.tariff, 20) || '?', num(b.stops, 0, 10) || 0, num(b.surge, 0, 5000) || 0, estPrice,
+        num(b.est_km, 0, 1000) || 0, num(b.est_min, 0, 1000) || 0,
+        num(b.nav_km, 0, 1000), num(b.nav_min, 0, 1000), num(b.nav_price, 1, 20000)]
+    );
+    res.json({ ok: true, id: String(r.rows[0].id) });
+  }));
+
+  // Поездка закончилась: цена, км и минуты, которые показал Яндекс Про.
+  app.post('/api/trips/finish', member(async (req, res) => {
+    const b = req.body;
+    await pool.query(
+      `UPDATE trip_reports SET real_price = $2, real_km = $3, real_min = $4, finished = NOW()
+       WHERE id = $1 AND finished IS NULL AND created > NOW() - INTERVAL '6 hours'`,
+      [parseInt(b.id, 10) || 0, num(b.real_price, 1, 20000), num(b.real_km, 0, 1000), num(b.real_min, 0, 1000)]
+    );
+    res.json({ ok: true });
+  }));
+
   // Открыто: счётчики без ключей и без адресов.
   app.get('/api/geocode-status', async (req, res) => {
     try {
@@ -439,6 +503,53 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       )).rows[0].n;
       const fmt = d => new Date(d).toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau' });
       const btn = 'border:none;padding:4px 8px;border-radius:4px;color:#fff;cursor:pointer;';
+      const addr = await geocoder.adminData();
+      const trips = (await pool.query('SELECT * FROM trip_reports ORDER BY id DESC LIMIT 50')).rows;
+      const acc = (await pool.query(
+        `SELECT COUNT(*) AS n,
+           AVG(real_price - est_price) AS avg_diff, AVG(ABS(real_price - est_price)) AS avg_abs,
+           AVG(ABS(real_price - nav_price)) FILTER (WHERE nav_price IS NOT NULL) AS nav_abs
+         FROM trip_reports WHERE real_price IS NOT NULL AND created > NOW() - INTERVAL '30 days'`
+      )).rows[0];
+      const lei = v => v == null ? '—' : `${Math.round(Number(v))} L`;
+
+      const missRows = addr.misses.map(m => `
+        <tr>
+          <td>${escapeHtml(m.text)}<br><a href="https://yandex.ru/maps/?text=${encodeURIComponent('Кишинёв ' + m.text)}" target="_blank" style="font-size:12px;">искать на карте</a></td>
+          <td>${escapeHtml(m.n)}</td>
+          <td style="white-space:nowrap;">${escapeHtml(fmt(m.last_seen))}</td>
+          <td style="white-space:nowrap;">
+            <form method="POST" action="/admin/community/address" style="display:inline;">
+              <input type="hidden" name="q" value="${escapeHtml(m.text)}">
+              <input type="text" name="point" placeholder="47.0105, 28.8638" style="width:150px;">
+              <button name="action" value="set" style="${btn}background:#38a169;">Сохранить точку</button>
+              <button name="action" value="dismiss" style="${btn}background:#718096;">Скрыть</button>
+            </form>
+          </td>
+        </tr>`).join('');
+      const pointRows = addr.points.map(p => `
+        <tr>
+          <td>${escapeHtml(p.q)}</td>
+          <td><a href="https://yandex.ru/maps/?pt=${p.lon},${p.lat}&z=17" target="_blank">${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}</a></td>
+          <td>${p.source === 'admin' ? 'админ' : `поездки: ${escapeHtml(p.n)}`}</td>
+          <td>
+            <form method="POST" action="/admin/community/address" style="display:inline;">
+              <input type="hidden" name="q" value="${escapeHtml(p.q)}">
+              <button name="action" value="remove" style="${btn}background:#e53e3e;">Удалить</button>
+            </form>
+          </td>
+        </tr>`).join('');
+      const countLine = addr.counts.map(c => `${c.source === 'admin' ? 'от админа' : 'с поездок'}: ${c.total}` +
+        (c.source === 'gps' ? ` (подтверждено 2+ поездками: ${c.confirmed})` : '')).join(' · ');
+      const tripRows = trips.map(t => `
+        <tr>
+          <td style="white-space:nowrap;">${escapeHtml(fmt(t.created))}</td>
+          <td>${escapeHtml(t.tariff)}${t.stops ? ` +${escapeHtml(t.stops)} заезд` : ''}${t.surge ? ` +${escapeHtml(t.surge)}` : ''}</td>
+          <td>${lei(t.est_price)} · ${Number(t.est_km).toFixed(1)} км · ${Math.round(t.est_min)} мин</td>
+          <td>${t.nav_price == null ? '—' : `${lei(t.nav_price)} · ${Number(t.nav_km).toFixed(1)} км · ${Math.round(t.nav_min)} мин`}</td>
+          <td>${t.real_price == null ? (t.finished ? 'цена не распознана' : '—') : `<b>${lei(t.real_price)}</b>`}${t.real_km != null ? ` · ${Number(t.real_km).toFixed(1)} км` : ''}${t.real_min != null ? ` · ${Math.round(t.real_min)} мин` : ''}</td>
+          <td>${t.real_price == null ? '' : `${t.real_price - t.est_price > 0 ? '+' : ''}${t.real_price - t.est_price} L`}</td>
+        </tr>`).join('');
 
       const chatRows = messages.map(m => `
         <tr style="${m.deleted ? 'opacity:.4' : ''}">
@@ -486,6 +597,21 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           th { background: #2b6cb0; color: #fff; } input[type=text] { padding: 6px; width: 260px; }
         </style></head><body>
         <div class="card"><a href="/admin/view-devices">← Устройства и ключи</a>${notice}</div>
+        <div class="card"><h2>📍 Адреса, которые не нашлись (${addr.misses.length})</h2>
+          <p style="font-size:13px;color:#4a5568;">Яндекс не нашёл эти адреса — цена по ним не показывалась. Найдите место на карте, скопируйте координаты («47.0105, 28.8638») и сохраните — дальше адрес будет находиться у всех. Точки с поездок водителей добавляются сами.</p>
+          <table><tr><th>Адрес с карточки</th><th>Раз</th><th>Последний</th><th></th></tr>${missRows || '<tr><td colspan="4">Все адреса находятся 👍</td></tr>'}</table>
+          <h3 style="margin-top:20px;">Свои точки адресов ${countLine ? `<span style="font-weight:normal;font-size:13px;">— ${escapeHtml(countLine)}</span>` : ''}</h3>
+          <form method="POST" action="/admin/community/address" style="margin-bottom:10px;">
+            <input type="text" name="q" placeholder="Адрес, как на карточке заказа">
+            <input type="text" name="point" placeholder="47.0105, 28.8638" style="width:150px;">
+            <button name="action" value="set" style="${btn}background:#38a169;">Добавить точку</button>
+          </form>
+          <table><tr><th>Адрес</th><th>Точка</th><th>Откуда</th><th></th></tr>${pointRows || '<tr><td colspan="4">Пока нет</td></tr>'}</table>
+        </div>
+        <div class="card"><h2>🎯 Точность цены</h2>
+          <p>За 30 дней поездок с ценой от Яндекса: <b>${escapeHtml(acc.n)}</b>. Средняя ошибка расчёта с карточки: <b>${lei(acc.avg_abs)}</b> (в среднем Яндекс ${acc.avg_diff != null && acc.avg_diff < 0 ? 'дешевле' : 'дороже'} на ${lei(acc.avg_diff == null ? null : Math.abs(acc.avg_diff))}). После «Поехали» по навигатору: <b>${lei(acc.nav_abs)}</b>.</p>
+          <table><tr><th>Когда</th><th>Тариф</th><th>Наш расчёт</th><th>По навигатору</th><th>Яндекс в конце</th><th>Разница</th></tr>${tripRows || '<tr><td colspan="6">Поездок пока нет</td></tr>'}</table>
+        </div>
         <div class="card"><h2>✈️ Аэропорт</h2><p>Сейчас в очереди водителей радара: <b>${escapeHtml(queue)}</b></p></div>
         <div class="card"><h2>👤 Клиенты</h2>
           <p>Номера в базе не хранятся — только зашифрованные отпечатки. Проверить или очистить номер можно, только введя его.</p>
@@ -533,6 +659,37 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       console.error(err);
     }
     res.redirect('/admin/community');
+  });
+
+  app.post('/admin/community/address', async (req, res) => {
+    const { action } = req.body;
+    const q = cleanText(req.body.q, 300);
+    let msg = '';
+    try {
+      if (!q) {
+        msg = 'Нужен адрес';
+      } else if (action === 'set') {
+        const m = String(req.body.point || '').match(/(-?\d+(?:\.\d+)?)\s*[,; ]\s*(-?\d+(?:\.\d+)?)/);
+        let lat = m ? Number(m[1]) : NaN, lon = m ? Number(m[2]) : NaN;
+        // Скопировали «долгота, широта» (как в ссылках Яндекса) — переставим.
+        if (lat < 40 && lon > 40) [lat, lon] = [lon, lat];
+        if (!(lat > 45 && lat < 49 && lon > 26 && lon < 31)) {
+          msg = 'Координаты не похожи на Молдову. Пример: 47.0105, 28.8638';
+        } else {
+          await geocoder.setAdminPoint(q, lat, lon);
+          msg = 'Точка сохранена: ' + q;
+        }
+      } else if (action === 'remove') {
+        await geocoder.removePoint(q);
+        msg = 'Точка удалена';
+      } else if (action === 'dismiss') {
+        await geocoder.dismissMiss(q);
+      }
+    } catch (err) {
+      console.error(err);
+      msg = 'Ошибка';
+    }
+    res.redirect('/admin/community' + (msg ? '?msg=' + encodeURIComponent(msg) : ''));
   });
 
   app.post('/admin/community/report', async (req, res) => {
