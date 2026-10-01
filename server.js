@@ -14,7 +14,7 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
 });
 
-const TRIAL_HOURS = 72;
+const TRIAL_HOURS = 168; // 7 дней
 
 async function initDB() {
   try {
@@ -133,6 +133,14 @@ function referralBonusDays() {
 
 // Контакты, ссылка на группу и ключ карты для приложения. Меняются переменными
 // в Railway без выпуска новой версии; пустое значение прячет кнопку в приложении.
+function parseTariffs() {
+  try {
+    const t = JSON.parse(process.env.TARIFFS || '');
+    if (Array.isArray(t) && t.length) return t.filter(x => x && x.days > 0 && x.price >= 0);
+  } catch (e) { /* по умолчанию ниже */ }
+  return [{ days: 30, price: 99 }];
+}
+
 app.get('/api/app-config', (req, res) => {
   const phone = process.env.CONTACT_PHONE ?? '+37378293919';
   res.json({
@@ -145,7 +153,16 @@ app.get('/api/app-config', (req, res) => {
     tiles_api_key: process.env.TILES_API_KEY || '',
     // Адреса ищет сервер (geocoder.js) — водителю не нужен свой ключ Яндекса.
     shared_geocoder: Object.keys(process.env).some(k => /^YANDEX_GEOCODER_KEY(_\d)?$/.test(k) && process.env[k].trim()),
-    referral_bonus_days: referralBonusDays()
+    referral_bonus_days: referralBonusDays(),
+    // Колокольчик «новая версия» в приложении: при выпуске новой версии поменяйте
+    // LATEST_VERSION_CODE / LATEST_VERSION_NAME и UPDATE_URL (пост с APK в Telegram).
+    latest_version_code: parseInt(process.env.LATEST_VERSION_CODE || '14', 10),
+    latest_version_name: process.env.LATEST_VERSION_NAME || '1.13',
+    update_url: process.env.UPDATE_URL || process.env.GROUP_URL || 'https://t.me/taxi_radar_chisinau',
+    update_notes: process.env.UPDATE_NOTES || '',
+    // Тарифы на экране «Подписка»: JSON вида [{"days":30,"price":99}]
+    tariffs: parseTariffs(),
+    currency: process.env.CURRENCY || 'лей'
   });
 });
 
@@ -241,7 +258,7 @@ app.post('/api/referral/apply', async (req, res) => {
   }
 });
 
-// 1. Запрос триала на 3 дня — один раз на устройство, по времени сервера
+// 1. Запрос триала на 7 дней — один раз на устройство, по времени сервера
 app.post('/api/request-trial', async (req, res) => {
   const { device_id } = req.body;
   if (!isValidDeviceId(device_id)) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
@@ -268,18 +285,18 @@ app.post('/api/request-trial', async (req, res) => {
     }
 
     const expireDate = new Date(Date.now() + TRIAL_HOURS * 3600 * 1000);
-    const trialKey = generateCode("TR3D");
+    const trialKey = generateCode("TR7D");
 
     await pool.query(
       'INSERT INTO devices (device_id, key_code, expires, last_seen, status, type, device_info) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-      [device_id, trialKey, expireDate, new Date(), 'active', 'Пробный (3 дня)', deviceInfo]
+      [device_id, trialKey, expireDate, new Date(), 'active', 'Пробный (7 дней)', deviceInfo]
     );
     await pool.query('INSERT INTO trial_history (device_id) VALUES ($1) ON CONFLICT DO NOTHING', [device_id]);
 
     return res.json({
       valid: true,
       force_lock: false,
-      message: "Активирован бесплатный доступ на 3 дня!",
+      message: "Активирован бесплатный доступ на 7 дней!",
       expires: expireDate.toISOString()
     });
   } catch (err) {
