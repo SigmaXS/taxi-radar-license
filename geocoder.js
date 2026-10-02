@@ -140,9 +140,26 @@ module.exports = function createGeocoder(pool) {
    * Порядок: точка от админа или подтверждённая двумя поездками → база
    * Яндекса → одна точка от водителя (если Яндекс адрес не знает).
    */
+  // Известные места, которые Яндекс по тексту карточки не находит
+  // («Международный аэропорт Кишинёв, Зона прилёта» и т. п.).
+  const BUILTIN = [
+    { re: /(аэропорт|aeroport|airport|\brmo\b|кишин[её]в.*прил[её]т|зона прил[её]та|зона выл[её]та)/i,
+      not: /(бельц|balti|bălți|одесс|ясс|iasi|бухарест|bucure|киев|kyiv|стамбул)/i,
+      lat: 46.9350, lon: 28.9330 },
+  ];
+
+  function builtin(q) {
+    for (const b of BUILTIN) {
+      if (b.re.test(q) && !(b.not && b.not.test(q))) return { found: true, lat: b.lat, lon: b.lon };
+    }
+    return null;
+  }
+
   async function lookup(rawQuery) {
     const q = normalize(rawQuery);
     if (!q) return { found: false };
+    const known = builtin(q);
+    if (known) return known;
     const own = (await pool.query('SELECT lat, lon, n, source FROM address_points WHERE q = $1', [q])).rows[0];
     if (own && (own.source === 'admin' || own.n >= 2)) return { found: true, lat: own.lat, lon: own.lon };
     const r = await lookupYandex(rawQuery, q);
