@@ -156,11 +156,11 @@ app.get('/api/app-config', (req, res) => {
     referral_bonus_days: referralBonusDays(),
     // Колокольчик «новая версия» в приложении: при выпуске новой версии поменяйте
     // LATEST_VERSION_CODE / LATEST_VERSION_NAME и UPDATE_URL (пост с APK в Telegram).
-    latest_version_code: parseInt(process.env.LATEST_VERSION_CODE || '15', 10),
-    latest_version_name: process.env.LATEST_VERSION_NAME || '1.14',
+    latest_version_code: parseInt(process.env.LATEST_VERSION_CODE || '16', 10),
+    latest_version_name: process.env.LATEST_VERSION_NAME || '1.15',
     update_url: process.env.UPDATE_URL || process.env.GROUP_URL || 'https://t.me/taxi_radar_chisinau',
     update_notes: process.env.UPDATE_NOTES ||
-      'Надбавка теперь по вашей точке и без ошибок; час пик в расчёте цены; исправлен сбой на Android 14; подсказки для Xiaomi в мастере настройки.',
+      'Новое: тёмная карта и места водителей (где поесть, мойка, заправка); метка «Радар»; цена заказа без точки Б после «Поехали»; кнопка «Подписка» в профиле.',
     // Тарифы на экране «Подписка»: JSON вида [{"days":30,"price":99}]
     tariffs: parseTariffs(),
     currency: process.env.CURRENCY || 'лей',
