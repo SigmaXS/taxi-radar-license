@@ -20,6 +20,7 @@ const NEGATIVE_MIN_DRIVERS = 2;
 // Метки на карте и сколько минут они живут.
 const REPORT_TYPES = {
   police: 60,
+  radar: 60,
   accident: 120,
   closure: 12 * 60,
   jam: 60,
