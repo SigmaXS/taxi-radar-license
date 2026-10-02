@@ -162,9 +162,25 @@ app.get('/api/app-config', (req, res) => {
     update_notes: process.env.UPDATE_NOTES || '',
     // Тарифы на экране «Подписка»: JSON вида [{"days":30,"price":99}]
     tariffs: parseTariffs(),
-    currency: process.env.CURRENCY || 'лей'
+    currency: process.env.CURRENCY || 'лей',
+    surge_base: surgeBase()
   });
 });
+
+// Цена «от …» у Яндекса без повышенного спроса: Эконом, Комфорт, Комфорт+.
+// Надбавка в виджете = цена сейчас − эта база. Яндекс её меняет (2 октября
+// 2026 подняли 30/45/65 → 45/60/80) — тогда меняем SURGE_BASE в Railway,
+// например «45,60,80», без нового приложения.
+function surgeBase() {
+  const [econom, comfort, comfortplus] = String(process.env.SURGE_BASE || '45,60,80')
+    .split(',').map(v => parseInt(v, 10));
+  const ok = v => Number.isFinite(v) && v > 0;
+  return {
+    econom: ok(econom) ? econom : 45,
+    comfort: ok(comfort) ? comfort : 60,
+    comfortplus: ok(comfortplus) ? comfortplus : 80
+  };
+}
 
 async function ensureReferralCode(deviceId) {
   const existing = await pool.query('SELECT * FROM referrals WHERE device_id = $1', [deviceId]);
