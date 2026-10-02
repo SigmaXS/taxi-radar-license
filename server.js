@@ -667,9 +667,11 @@ app.post('/admin/action', async (req, res) => {
       }
       const r = await pool.query(
         `UPDATE devices SET expires = GREATEST(expires, NOW()) + ($1 || ' days')::INTERVAL,
-           status = CASE WHEN status = 'banned' THEN status ELSE 'active' END
+           status = CASE WHEN status = 'banned' THEN status ELSE 'active' END,
+           type = $3
          WHERE device_id = $2 RETURNING expires`,
-        [String(days), device_id]
+        // В колонке «Тип» видно, что дни добавлены вручную, сколько и когда.
+        [String(days), device_id, `Продлено +${days} дн. (${new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Chisinau', day: '2-digit', month: '2-digit' })})`]
       );
       if (!r.rows.length) return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Устройство не найдено'));
     }
