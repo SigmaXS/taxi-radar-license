@@ -167,18 +167,18 @@ app.get('/api/app-config', (req, res) => {
   });
 });
 
-// Цена «от …» у Яндекса без повышенного спроса: Эконом, Комфорт, Комфорт+.
-// Надбавка в виджете = цена сейчас − эта база. Яндекс её меняет (2 октября
-// 2026 подняли 30/45/65 → 45/60/80) — тогда меняем SURGE_BASE в Railway,
-// например «45,60,80», без нового приложения.
+// Старт тарифа без надбавки: Эконом, Комфорт, Комфорт+. Цена «от …» у Яндекса
+// = старт + надбавка (+15 / +35 / +55), надбавка в виджете = цена − старт.
+// Если Яндекс поменяет тарифы — SURGE_BASE в Railway, например «30,45,65»,
+// без нового приложения.
 function surgeBase() {
-  const [econom, comfort, comfortplus] = String(process.env.SURGE_BASE || '45,60,80')
+  const [econom, comfort, comfortplus] = String(process.env.SURGE_BASE || '30,45,65')
     .split(',').map(v => parseInt(v, 10));
   const ok = v => Number.isFinite(v) && v > 0;
   return {
-    econom: ok(econom) ? econom : 45,
-    comfort: ok(comfort) ? comfort : 60,
-    comfortplus: ok(comfortplus) ? comfortplus : 80
+    econom: ok(econom) ? econom : 30,
+    comfort: ok(comfort) ? comfort : 45,
+    comfortplus: ok(comfortplus) ? comfortplus : 65
   };
 }
 
