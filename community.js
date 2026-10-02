@@ -62,6 +62,16 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       created TIMESTAMP NOT NULL DEFAULT NOW(),
       PRIMARY KEY (phone_hash, device_id, tag)
     );
+    CREATE TABLE IF NOT EXISTS traffic_samples (
+      id BIGSERIAL PRIMARY KEY,
+      created TIMESTAMP NOT NULL DEFAULT NOW(),
+      hour INT NOT NULL,
+      weekend BOOLEAN NOT NULL,
+      osrm_min REAL NOT NULL,
+      yandex_min REAL NOT NULL,
+      km REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS traffic_samples_created ON traffic_samples (created);
     CREATE TABLE IF NOT EXISTS places (
       id BIGSERIAL PRIMARY KEY,
       device_id VARCHAR(100) NOT NULL,
@@ -218,6 +228,20 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         admin: m.admin === true
       }))
     });
+  }));
+
+  // Сколько новых сообщений после after (не своих) — для красного кружка на главном.
+  // after = 0 (чат ещё не открывали) — считаем сообщения за последние сутки.
+  app.post('/api/chat/unread', member(async (req, res, deviceId) => {
+    const after = parseInt(req.body.after, 10) || 0;
+    const r = (await pool.query(
+      after > 0
+        ? `SELECT COUNT(*) FILTER (WHERE device_id <> $2) AS n, MAX(id) AS last FROM chat_messages WHERE id > $1 AND NOT deleted`
+        : `SELECT COUNT(*) FILTER (WHERE device_id <> $2) AS n, MAX(id) AS last FROM chat_messages
+           WHERE created > NOW() - INTERVAL '1 day' AND NOT deleted AND $1 = 0`,
+      [after, deviceId]
+    )).rows[0];
+    res.json({ ok: true, count: Math.min(Number(r.n) || 0, 999), last_id: Number(r.last) || after });
   }));
 
   // Админ чата прямо из приложения: удалить сообщение или заглушить автора.
@@ -452,6 +476,49 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     }
     res.json({ ok: true });
   }));
+
+  // ---------- общие пробки: обучение на поездках всех водителей ----------
+
+  // Пример: сколько ехать по OSRM (пустые дороги) и сколько по Яндексу в этот час.
+  app.post('/api/traffic/sample', member(async (req, res, deviceId) => {
+    const hour = parseInt(req.body.hour, 10);
+    const osrm = Number(req.body.osrm_min), yandex = Number(req.body.yandex_min), km = Number(req.body.km);
+    const ratio = yandex / osrm;
+    if (!(hour >= 0 && hour <= 23) || !(osrm >= 3 && osrm <= 300) || !(km > 0 && km < 500) || !(ratio >= 0.5 && ratio <= 3)) {
+      return res.json({ ok: false });
+    }
+    if (tooOften('traffic:' + deviceId, 80, 24 * 3600 * 1000)) return res.json({ ok: false });
+    await pool.query(
+      'INSERT INTO traffic_samples (hour, weekend, osrm_min, yandex_min, km) VALUES ($1, $2, $3, $4, $5)',
+      [hour, req.body.weekend === true, osrm, yandex, km]
+    );
+    res.json({ ok: true });
+  }));
+
+  // Поправка на каждый час (будни / выходные): медиана «Яндекс / OSRM» за 60 дней
+  // по этому часу ±1, если примеров хотя бы 3. Пересчитываем раз в 10 минут.
+  const median = a => { const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+  async function rebuildTraffic() {
+    try {
+      const rows = (await pool.query(
+        `SELECT hour, weekend, yandex_min / osrm_min AS r FROM traffic_samples WHERE created > NOW() - INTERVAL '60 days'`
+      )).rows;
+      const table = { wd: [], we: [], n_wd: [], n_we: [], total: rows.length };
+      for (const weekend of [false, true]) {
+        for (let h = 0; h < 24; h++) {
+          const near = rows.filter(x => x.weekend === weekend && Math.min(Math.abs(x.hour - h), 24 - Math.abs(x.hour - h)) <= 1).map(x => Number(x.r));
+          const v = near.length >= 3 ? Math.min(2.2, Math.max(0.8, median(near))) : null;
+          table[weekend ? 'we' : 'wd'].push(v == null ? null : Math.round(v * 100) / 100);
+          table[weekend ? 'n_we' : 'n_wd'].push(near.length);
+        }
+      }
+      app.locals.trafficTable = table;
+    } catch (err) {
+      console.error('Traffic table:', err.message);
+    }
+  }
+  setTimeout(rebuildTraffic, 5000);
+  setInterval(rebuildTraffic, 10 * 60 * 1000);
 
   // ---------- места водителей ----------
 
@@ -812,6 +879,16 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         <div class="card"><h2>✍ Отзывы о клиентах (последние 30)</h2>
           <p style="font-size:13px;color:#4a5568;">Водители видят отзыв сразу. Удаляйте оскорбления, личные данные и всё, что не о поездке.</p>
           <table><tr><th>Когда</th><th>Отзыв</th><th>Кто</th><th></th></tr>${reviewRows || '<tr><td colspan="4">Отзывов пока нет</td></tr>'}</table>
+        </div>
+        <div class="card"><h2>🚦 Общие пробки (по поездкам всех водителей)</h2>
+          ${(() => {
+            const t = req.app.locals.trafficTable;
+            if (!t || !t.total) return '<p>Примеров пока нет — их присылают версии 1.16 и новее.</p>';
+            const cell = (v, n) => v == null ? `<span style="color:#a0aec0;">— (${n})</span>` : `<b>×${v.toFixed(2)}</b> <span style="color:#718096;font-size:12px;">(${n})</span>`;
+            const rows = Array.from({ length: 24 }, (_, h) => `<tr><td>${h}:00</td><td>${cell(t.wd[h], t.n_wd[h])}</td><td>${cell(t.we[h], t.n_we[h])}</td></tr>`).join('');
+            return `<p style="font-size:13px;color:#4a5568;">Во сколько раз поездка дольше, чем по пустым дорогам. В скобках — сколько поездок (этот час ±1, за 60 дней). Нужно минимум 3. Всего примеров: <b>${t.total}</b>.</p>
+              <table><tr><th>Час</th><th>Будни</th><th>Выходные</th></tr>${rows}</table>`;
+          })()}
         </div>
         <div class="card"><h2>📍 Места водителей (последние 50)</h2>
           <table><tr><th>Тип</th><th>Название и заметка</th><th>Где</th><th>👍/👎</th><th></th></tr>${placeRows || '<tr><td colspan="5">Мест пока нет</td></tr>'}</table>

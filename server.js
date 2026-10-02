@@ -158,6 +158,14 @@ app.get('/api/app-config', (req, res) => {
     // LATEST_VERSION_CODE / LATEST_VERSION_NAME и UPDATE_URL (пост с APK в Telegram).
     latest_version_code: parseInt(process.env.LATEST_VERSION_CODE || '16', 10),
     latest_version_name: process.env.LATEST_VERSION_NAME || '1.15',
+    // Ниже этой версии приложение пишет «⚠️ Обновите приложение» (с 1.16).
+    // По умолчанию — последняя версия; MIN_VERSION_CODE в Railway — чтобы напоминать только совсем старым.
+    min_version_code: parseInt(process.env.MIN_VERSION_CODE || process.env.LATEST_VERSION_CODE || '16', 10),
+    // Общие пробки по часам (см. community.js): будни / выходные, null — мало данных.
+    traffic: req.app.locals.trafficTable ? {
+      wd: req.app.locals.trafficTable.wd,
+      we: req.app.locals.trafficTable.we
+    } : null,
     update_url: process.env.UPDATE_URL || process.env.GROUP_URL || 'https://t.me/taxi_radar_chisinau',
     update_notes: process.env.UPDATE_NOTES ||
       'Новое: тёмная карта и места водителей (где поесть, мойка, заправка); метка «Радар»; цена заказа без точки Б после «Поехали»; кнопка «Подписка» в профиле.',
