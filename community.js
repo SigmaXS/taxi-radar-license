@@ -30,6 +30,10 @@ const REPORT_TYPES = {
   addr_cancel: 90 * 24 * 60
 };
 
+// Места водителей: где поесть, помыть машину, заправиться и т. д. Живут, пока
+// их не удалят; три «не советую» больше, чем «советую», — место скрывается.
+const PLACE_TYPES = ['food', 'wash', 'fuel', 'coffee', 'wc', 'tire', 'parking'];
+
 // Стоянка такси у аэропорта Кишинёва: «в очереди», если телефон пинговал недавно.
 const AIRPORT_QUEUE_MINUTES = 5;
 
@@ -57,6 +61,23 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       tag VARCHAR(20) NOT NULL,
       created TIMESTAMP NOT NULL DEFAULT NOW(),
       PRIMARY KEY (phone_hash, device_id, tag)
+    );
+    CREATE TABLE IF NOT EXISTS places (
+      id BIGSERIAL PRIMARY KEY,
+      device_id VARCHAR(100) NOT NULL,
+      type VARCHAR(20) NOT NULL,
+      name VARCHAR(60) NOT NULL,
+      note VARCHAR(200) NOT NULL DEFAULT '',
+      lat DOUBLE PRECISION NOT NULL,
+      lon DOUBLE PRECISION NOT NULL,
+      created TIMESTAMP NOT NULL DEFAULT NOW(),
+      hidden BOOLEAN NOT NULL DEFAULT false
+    );
+    CREATE TABLE IF NOT EXISTS place_votes (
+      place_id BIGINT NOT NULL,
+      device_id VARCHAR(100) NOT NULL,
+      good BOOLEAN NOT NULL,
+      PRIMARY KEY (place_id, device_id)
     );
     CREATE TABLE IF NOT EXISTS client_reviews (
       phone_hash CHAR(64) NOT NULL,
@@ -432,6 +453,79 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true });
   }));
 
+  // ---------- места водителей ----------
+
+  app.post('/api/places/list', member(async (req, res, deviceId) => {
+    const lat = Number(req.body.lat), lon = Number(req.body.lon);
+    if (!validPoint(lat, lon)) return res.json({ ok: true, places: [] });
+    const rows = (await pool.query(
+      `SELECT p.id, p.type, p.name, p.note, p.lat, p.lon, p.device_id,
+              COUNT(v.*) FILTER (WHERE v.good) AS up,
+              COUNT(v.*) FILTER (WHERE NOT v.good) AS down,
+              BOOL_OR(v.device_id = $5 AND v.good) AS my_up,
+              BOOL_OR(v.device_id = $5 AND NOT v.good) AS my_down
+       FROM places p LEFT JOIN place_votes v ON v.place_id = p.id
+       WHERE NOT p.hidden AND p.lat BETWEEN $1 AND $2 AND p.lon BETWEEN $3 AND $4
+       GROUP BY p.id ORDER BY p.created DESC LIMIT 500`,
+      [lat - 0.27, lat + 0.27, lon - 0.4, lon + 0.4, deviceId]
+    )).rows;
+    res.json({
+      ok: true,
+      places: rows
+        .filter(r => !(Number(r.down) >= 3 && Number(r.down) > Number(r.up)))
+        .map(r => ({
+          id: Number(r.id), type: r.type, name: r.name, note: r.note, lat: r.lat, lon: r.lon,
+          up: Number(r.up), down: Number(r.down), mine: r.device_id === deviceId,
+          vote: r.my_up ? 1 : r.my_down ? -1 : 0
+        }))
+    });
+  }));
+
+  app.post('/api/places/add', member(async (req, res, deviceId) => {
+    const type = req.body.type;
+    const lat = Number(req.body.lat), lon = Number(req.body.lon);
+    const name = cleanText(req.body.name, 60);
+    const note = cleanText(req.body.note, 200).replace(/https?:\/\/\S+|www\.\S+/gi, '…');
+    if (!PLACE_TYPES.includes(type) || !validPoint(lat, lon) || !name) {
+      return res.json({ ok: false, message: 'Укажите тип и название' });
+    }
+    if (tooOften('place:' + deviceId, 10, 24 * 3600 * 1000)) {
+      return res.json({ ok: false, message: 'Не больше 10 мест в сутки' });
+    }
+    const r = await pool.query(
+      'INSERT INTO places (device_id, type, name, note, lat, lon) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [deviceId, type, name, note, lat, lon]
+    );
+    // Автор — сразу «советую».
+    await pool.query('INSERT INTO place_votes (place_id, device_id, good) VALUES ($1, $2, true)', [r.rows[0].id, deviceId]);
+    res.json({ ok: true, id: Number(r.rows[0].id) });
+  }));
+
+  // vote: 1 — советую, -1 — не советую, 0 — убрать свой голос.
+  app.post('/api/places/vote', member(async (req, res, deviceId) => {
+    const id = parseInt(req.body.id, 10);
+    const vote = Number(req.body.vote);
+    if (!(await pool.query('SELECT 1 FROM places WHERE id = $1 AND NOT hidden', [id])).rows.length) {
+      return res.json({ ok: false, message: 'Места уже нет' });
+    }
+    if (vote === 0) {
+      await pool.query('DELETE FROM place_votes WHERE place_id = $1 AND device_id = $2', [id, deviceId]);
+    } else {
+      await pool.query(
+        `INSERT INTO place_votes (place_id, device_id, good) VALUES ($1, $2, $3)
+         ON CONFLICT (place_id, device_id) DO UPDATE SET good = $3`,
+        [id, deviceId, vote > 0]
+      );
+    }
+    res.json({ ok: true });
+  }));
+
+  // Удалить может только автор (и админ — в админке).
+  app.post('/api/places/delete', member(async (req, res, deviceId) => {
+    const r = await pool.query('UPDATE places SET hidden = true WHERE id = $1 AND device_id = $2', [parseInt(req.body.id, 10), deviceId]);
+    res.json({ ok: r.rowCount > 0 });
+  }));
+
   // ---------- аэропорт ----------
 
   // Приложение пингует, только пока телефон на стоянке такси у аэропорта.
@@ -651,6 +745,22 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
             </form>
           </td>
         </tr>`).join('');
+      const placesList = (await pool.query(
+        `SELECT p.id, p.type, p.name, p.note, p.lat, p.lon, p.hidden,
+                COUNT(v.*) FILTER (WHERE v.good) AS up, COUNT(v.*) FILTER (WHERE NOT v.good) AS down
+         FROM places p LEFT JOIN place_votes v ON v.place_id = p.id
+         GROUP BY p.id ORDER BY p.created DESC LIMIT 50`
+      )).rows;
+      const placeRows = placesList.map(p => `
+        <tr style="${p.hidden ? 'opacity:.4' : ''}">
+          <td>${escapeHtml(p.type)}</td>
+          <td><b>${escapeHtml(p.name)}</b><br>${escapeHtml(p.note)}</td>
+          <td><a href="https://yandex.ru/maps/?pt=${p.lon},${p.lat}&z=17" target="_blank">карта</a></td>
+          <td>${escapeHtml(p.up)} / ${escapeHtml(p.down)}</td>
+          <td>${p.hidden ? 'удалено' : `<form method="POST" action="/admin/community/place" style="display:inline;">
+            <input type="hidden" name="id" value="${escapeHtml(p.id)}">
+            <button style="${btn}background:#e53e3e;">Удалить</button></form>`}</td>
+        </tr>`).join('');
       const tagRows = tagStats.map(t => `<li>${escapeHtml((CLIENT_TAGS[t.tag] || {}).label || t.tag)}: ${t.n} отметок, ${t.phones} номеров</li>`).join('');
       const notice = req.query.msg ? `<p style="background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : '';
 
@@ -702,6 +812,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         <div class="card"><h2>✍ Отзывы о клиентах (последние 30)</h2>
           <p style="font-size:13px;color:#4a5568;">Водители видят отзыв сразу. Удаляйте оскорбления, личные данные и всё, что не о поездке.</p>
           <table><tr><th>Когда</th><th>Отзыв</th><th>Кто</th><th></th></tr>${reviewRows || '<tr><td colspan="4">Отзывов пока нет</td></tr>'}</table>
+        </div>
+        <div class="card"><h2>📍 Места водителей (последние 50)</h2>
+          <table><tr><th>Тип</th><th>Название и заметка</th><th>Где</th><th>👍/👎</th><th></th></tr>${placeRows || '<tr><td colspan="5">Мест пока нет</td></tr>'}</table>
         </div>
         <div class="card"><h2>🗺 Метки на дороге (активные: ${reports.length})</h2>
           <table><tr><th>Тип</th><th>Где</th><th>Поставлена</th><th>До</th><th>Кто</th><th></th></tr>${reportRows || '<tr><td colspan="6">Нет активных меток</td></tr>'}</table>
@@ -768,6 +881,15 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       console.error(err);
     }
     res.redirect('/admin/community?msg=' + encodeURIComponent('Отзыв удалён'));
+  });
+
+  app.post('/admin/community/place', async (req, res) => {
+    try {
+      await pool.query('UPDATE places SET hidden = true WHERE id = $1', [parseInt(req.body.id, 10)]);
+    } catch (err) {
+      console.error(err);
+    }
+    res.redirect('/admin/community?msg=' + encodeURIComponent('Место удалено'));
   });
 
   app.post('/admin/community/report', async (req, res) => {
