@@ -168,18 +168,20 @@ app.get('/api/app-config', (req, res) => {
   });
 });
 
-// Старт тарифа без надбавки: Эконом, Комфорт, Комфорт+. Цена «от …» у Яндекса
+// Старт тарифа без надбавки: Эконом, Комфорт, Комфорт+, Доставка. Цена «от …» у Яндекса
 // = старт + надбавка (+15 / +35 / +55), надбавка в виджете = цена − старт.
-// Если Яндекс поменяет тарифы — SURGE_BASE в Railway, например «30,45,65»,
+// Если Яндекс поменяет тарифы — SURGE_BASE в Railway, например «30,45,65,25»,
 // без нового приложения.
 function surgeBase() {
-  const [econom, comfort, comfortplus] = String(process.env.SURGE_BASE || '30,45,65')
+  const [econom, comfort, comfortplus, express] = String(process.env.SURGE_BASE || '30,45,65,25')
     .split(',').map(v => parseInt(v, 10));
   const ok = v => Number.isFinite(v) && v > 0;
   return {
     econom: ok(econom) ? econom : 30,
     comfort: ok(comfort) ? comfort : 45,
-    comfortplus: ok(comfortplus) ? comfortplus : 65
+    comfortplus: ok(comfortplus) ? comfortplus : 65,
+    // «Доставка» у Яндекса — класс «express».
+    express: ok(express) ? express : 25
   };
 }
 
