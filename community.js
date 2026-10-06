@@ -21,6 +21,7 @@ const NEGATIVE_MIN_DRIVERS = 2;
 const REPORT_TYPES = {
   police: 60,
   radar: 60,
+  danger: 60,
   accident: 120,
   closure: 12 * 60,
   jam: 60,

@@ -15,6 +15,12 @@ const NOT_FOUND_HOURS = 24;
 // Две точки дальше этого друг от друга — кто-то нажал не там; не усредняем.
 const LEARN_AGREE_KM = 0.3;
 const MAX_FROM_CENTER_KM = 150;
+// Версия выбора точки из ответа Яндекса. v2 — самый точный вариант, а не
+// ближайший к центру (тот уводил на середину улицы или соседний объект).
+// Строки кэша старой версии переспрашиваем; если Яндекс недоступен — берём их.
+const CACHE_VERSION = 2;
+// Насколько Яндекс уверен в точке: дом найден точно / по номеру / рядом.
+const GOOD_PRECISION = ['exact', 'number', 'near'];
 
 function haversineKm(a, b) {
   const R = 6371;
@@ -48,6 +54,7 @@ module.exports = function createGeocoder(pool) {
       created TIMESTAMP NOT NULL DEFAULT NOW(),
       hits INT NOT NULL DEFAULT 0
     );
+    ALTER TABLE geocode_cache ADD COLUMN IF NOT EXISTS v INT NOT NULL DEFAULT 1;
     CREATE TABLE IF NOT EXISTS address_points (
       q VARCHAR(300) PRIMARY KEY,
       lat DOUBLE PRECISION NOT NULL,
@@ -114,13 +121,15 @@ module.exports = function createGeocoder(pool) {
       throw e;
     }
     const members = (await r.json()).response.GeoObjectCollection.featureMember;
-    let best = null;
-    for (const m of members) {
+    // Яндекс сортирует варианты по точности. Берём первый точный (дом) не
+    // дальше 150 км; если дома нет — первый вообще в этих пределах.
+    const points = members.map(m => {
       const [lon, lat] = m.GeoObject.Point.pos.split(' ').map(Number);
-      const d = haversineKm({ lat, lon }, CENTER);
-      if (!best || d < best.d) best = { lat, lon, d };
-    }
-    return best && { lat: best.lat, lon: best.lon };
+      const meta = (m.GeoObject.metaDataProperty || {}).GeocoderMetaData || {};
+      return { lat, lon, precision: meta.precision };
+    }).filter(p => haversineKm(p, CENTER) <= MAX_FROM_CENTER_KM);
+    const best = points.find(p => GOOD_PRECISION.includes(p.precision)) || points[0];
+    return best ? { lat: best.lat, lon: best.lon } : null;
   }
 
   async function askAnyKey(q) {
@@ -169,29 +178,31 @@ module.exports = function createGeocoder(pool) {
 
   async function lookupYandex(rawQuery, q) {
     const cached = await pool.query(
-      `SELECT lat, lon FROM geocode_cache
+      `SELECT lat, lon, v FROM geocode_cache
        WHERE q = $1 AND (
          (lat IS NOT NULL AND created > NOW() - ($2 || ' days')::INTERVAL) OR
          (lat IS NULL AND created > NOW() - ($3 || ' hours')::INTERVAL))`,
       [q, String(FOUND_DAYS), String(NOT_FOUND_HOURS)]
     );
-    if (cached.rows.length > 0) {
+    const row = cached.rows[0];
+    const fromRow = r => r.lat == null ? { found: false } : { found: true, lat: r.lat, lon: r.lon };
+    if (row && row.v >= CACHE_VERSION) {
       cacheHits++;
       pool.query('UPDATE geocode_cache SET hits = hits + 1 WHERE q = $1', [q]).catch(() => {});
-      const row = cached.rows[0];
-      return row.lat == null ? { found: false } : { found: true, lat: row.lat, lon: row.lon };
+      return fromRow(row);
     }
-    if (!enabled()) return null;
+    // Старая строка: переспрашиваем Яндекс, а без ключей или лимита — отдаём её.
+    if (!enabled() || usableKeys().length === 0) return row ? fromRow(row) : null;
     if (inFlight.has(q)) return inFlight.get(q);
 
     const job = (async () => {
       const answer = await askAnyKey(rawQuery);
-      if (!answer) return null;
+      if (!answer) return row ? fromRow(row) : null;
       const p = answer.point;
       await pool.query(
-        `INSERT INTO geocode_cache (q, lat, lon, created) VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (q) DO UPDATE SET lat = $2, lon = $3, created = NOW()`,
-        [q, p ? p.lat : null, p ? p.lon : null]
+        `INSERT INTO geocode_cache (q, lat, lon, created, v) VALUES ($1, $2, $3, NOW(), $4)
+         ON CONFLICT (q) DO UPDATE SET lat = $2, lon = $3, created = NOW(), v = $4`,
+        [q, p ? p.lat : null, p ? p.lon : null, CACHE_VERSION]
       );
       return p ? { found: true, lat: p.lat, lon: p.lon } : { found: false };
     })();
