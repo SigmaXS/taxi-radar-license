@@ -199,6 +199,20 @@ function findPhones(text) {
 }
 
 module.exports = function registerOrderPrice(app, { member, geocoder, clientSummary, phoneHash, tooOften, getTraffic }) {
+  // Как в Android (RouteFareCalculator.addressKey): подъезд геокодеру только мешает —
+  // «…, подъезд 1» он уводил в другое место. Не нашёлся — ещё раз с «Кишинёв, …».
+  const ENTRANCE_TAIL = /[,\s]*(entrance|scara|scară|подъезд|подъ\.)\s*\S+/gi;
+  async function find(q) {
+    const clean = String(q).replace(ENTRANCE_TAIL, '').trim().replace(/,$/, '');
+    try {
+      const r = await geocoder.lookup(clean);
+      if (r && r.found) return r;
+      if (/chi[șs]in|кишин/i.test(clean)) return r;
+      return await geocoder.lookup('Кишинёв, ' + clean);
+    } catch (_) {
+      return null;
+    }
+  }
   app.post('/api/order/price', member(async (req, res, deviceId) => {
     if (tooOften('oprice:' + deviceId, 120, 60 * 60 * 1000)) {
       return res.json({ ok: false, reason: 'often', message: 'Слишком часто — подождите немного' });
@@ -220,11 +234,14 @@ module.exports = function registerOrderPrice(app, { member, geocoder, clientSumm
       return res.json({ ok: false, reason: 'no_route', message: t('Не вижу адресов А и Б на снимке', 'Nu văd adresele A și B pe captură') });
     }
 
-    const looked = await Promise.all([card.a, ...card.stops, card.b].map(q => geocoder.lookup(q).catch(() => null)));
+    const names = [card.a, ...card.stops, card.b];
+    const looked = await Promise.all(names.map(find));
     const pt = r => (r && r.found ? { lat: r.lat, lon: r.lon } : null);
     const A = pt(looked[0]), B = pt(looked[looked.length - 1]);
     if (!A || !B) {
-      return res.json({ ok: false, reason: 'geocode', message: t('Адрес не нашёлся на карте', 'Adresa nu a fost găsită') });
+      const missing = !A ? card.a : card.b;
+      console.log('order/price: не нашёлся адрес', JSON.stringify(missing));
+      return res.json({ ok: false, reason: 'geocode', message: t(`Не нашёлся адрес: ${missing}`, `Adresa nu a fost găsită: ${missing}`) });
     }
     const stops = looked.slice(1, -1).map(pt).filter(s => s && km(s, A) >= 0.3 && km(s, B) >= 0.3);
     const r = await route([A, ...stops, B]).catch(() => null);
