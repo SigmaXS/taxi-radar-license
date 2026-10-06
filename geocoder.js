@@ -132,6 +132,44 @@ module.exports = function createGeocoder(pool) {
     return best ? { lat: best.lat, lon: best.lon } : null;
   }
 
+  // Поиск на карте: несколько вариантов рядом с водителем. «Штефан чел маре 10»
+  // есть и в Кишинёве, и в Гратиештах — показываем ближайшие, водитель выбирает.
+  const searchCache = new Map();
+  async function search(rawQuery, near) {
+    const q = normalize(rawQuery);
+    if (!q) return [];
+    const at = near && Number.isFinite(near.lat) && Number.isFinite(near.lon) ? near : CENTER;
+    const cacheKey = q + '|' + at.lat.toFixed(2) + ',' + at.lon.toFixed(2);
+    const hit = searchCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < 24 * 3600 * 1000) return hit.list;
+    for (const key of usableKeys()) {
+      used.set(key, (used.get(key) || 0) + 1);
+      const url = 'https://geocode-maps.yandex.ru/1.x/?apikey=' + encodeURIComponent(key) +
+        '&geocode=' + encodeURIComponent(rawQuery) +
+        `&format=json&results=10&lang=ru_RU&ll=${at.lon},${at.lat}&spn=0.3,0.3&rspn=0`;
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+        if (r.status === 403 || r.status === 429) { rejected.add(key); continue; }
+        if (!r.ok) return null;
+        const members = (await r.json()).response.GeoObjectCollection.featureMember;
+        const list = members.map(m => {
+          const g = m.GeoObject;
+          const [lon, lat] = g.Point.pos.split(' ').map(Number);
+          return { name: g.name || '', desc: g.description || '', lat, lon, km: Math.round(haversineKm({ lat, lon }, at) * 10) / 10 };
+        }).filter(p => haversineKm(p, CENTER) <= MAX_FROM_CENTER_KM)
+          .sort((a, b) => a.km - b.km)
+          .slice(0, 6);
+        searchCache.set(cacheKey, { at: Date.now(), list });
+        if (searchCache.size > 500) searchCache.delete(searchCache.keys().next().value);
+        return list;
+      } catch (err) {
+        console.error('Geocoder search:', err.message);
+        return null;
+      }
+    }
+    return null;
+  }
+
   async function askAnyKey(q) {
     for (const key of usableKeys()) {
       try {
@@ -306,5 +344,5 @@ module.exports = function createGeocoder(pool) {
     };
   }
 
-  return { lookup, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize };
+  return { lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize };
 };

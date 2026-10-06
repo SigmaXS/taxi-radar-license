@@ -635,6 +635,16 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true, ...r });
   }));
 
+  // Поиск адреса на карте: до 6 вариантов, ближайшие к водителю первыми.
+  app.post('/api/geocode/search', member(async (req, res, deviceId) => {
+    if (tooOften('gsearch:' + deviceId, 40, 10 * 60 * 1000)) {
+      return res.json({ ok: false, message: 'Слишком часто' });
+    }
+    const list = await geocoder.search(cleanText(req.body.q, 300), { lat: Number(req.body.lat), lon: Number(req.body.lon) });
+    if (!list) return res.json({ ok: false, message: 'Геокодер недоступен' });
+    res.json({ ok: true, results: list });
+  }));
+
   app.post('/api/geocode/miss', member(async (req, res, deviceId) => {
     if (tooOften('miss:' + deviceId, 60, 10 * 60 * 1000)) return res.json({ ok: false });
     await geocoder.miss(cleanText(req.body.q, 300));
