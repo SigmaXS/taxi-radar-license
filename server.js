@@ -156,11 +156,11 @@ app.get('/api/app-config', (req, res) => {
     referral_bonus_days: referralBonusDays(),
     // Колокольчик «новая версия» в приложении: при выпуске новой версии поменяйте
     // LATEST_VERSION_CODE / LATEST_VERSION_NAME и UPDATE_URL (пост с APK в Telegram).
-    latest_version_code: parseInt(process.env.LATEST_VERSION_CODE || '16', 10),
-    latest_version_name: process.env.LATEST_VERSION_NAME || '1.15',
+    latest_version_code: parseInt(process.env.LATEST_VERSION_CODE || '18', 10),
+    latest_version_name: process.env.LATEST_VERSION_NAME || '1.16',
     // Ниже этой версии приложение пишет «⚠️ Обновите приложение» (с 1.16).
     // По умолчанию — последняя версия; MIN_VERSION_CODE в Railway — чтобы напоминать только совсем старым.
-    min_version_code: parseInt(process.env.MIN_VERSION_CODE || process.env.LATEST_VERSION_CODE || '16', 10),
+    min_version_code: parseInt(process.env.MIN_VERSION_CODE || process.env.LATEST_VERSION_CODE || '18', 10),
     // Общие пробки по часам (см. community.js): будни / выходные, null — мало данных.
     traffic: req.app.locals.trafficTable ? {
       wd: req.app.locals.trafficTable.wd,
@@ -168,7 +168,7 @@ app.get('/api/app-config', (req, res) => {
     } : null,
     update_url: process.env.UPDATE_URL || process.env.GROUP_URL || 'https://t.me/taxi_radar_chisinau',
     update_notes: process.env.UPDATE_NOTES ||
-      'Новое: тёмная карта и места водителей (где поесть, мойка, заправка); метка «Радар»; цена заказа без точки Б после «Поехали»; кнопка «Подписка» в профиле.',
+      'Новое: цена заказа точнее (адрес до дома, без лишних остановок, пробки по поездкам всех водителей); карта как мини-Waze — отмечайте радары и полицию кнопкой «+» на кружке, предупреждение за 400 и 100 м; поиск адреса на карте; исправлены уведомления на Xiaomi.',
     // Тарифы на экране «Подписка»: JSON вида [{"days":30,"price":99}]
     tariffs: parseTariffs(),
     currency: process.env.CURRENCY || 'лей',
