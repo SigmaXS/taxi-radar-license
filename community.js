@@ -624,6 +624,12 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
 
   const geocoder = require('./geocoder')(pool);
 
+  // Цена заказа по тексту снимка — для iPhone (фоновое действие «Быстрых команд»).
+  require('./order_price')(app, {
+    member, geocoder, clientSummary, phoneHash, tooOften,
+    getTraffic: () => app.locals.trafficTable || null
+  });
+
   app.post('/api/geocode', member(async (req, res, deviceId) => {
     // Одна карточка — 2–5 адресов; 200 за 10 минут хватит с запасом.
     if (tooOften('geo:' + deviceId, 200, 10 * 60 * 1000)) {
