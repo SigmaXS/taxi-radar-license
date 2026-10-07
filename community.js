@@ -18,13 +18,15 @@ const CLIENT_TAG_DAYS = 180;
 const NEGATIVE_MIN_DRIVERS = 2;
 
 // Метки на карте и сколько минут они живут.
+// Временные (полиция, радар, опасность, ДТП, пробка) живут час и продлеваются ответом
+// «Ещё здесь». Остальные (перекрытие, яма, адреса) — пока водители их не уберут.
 const REPORT_TYPES = {
   police: 60,
   radar: 60,
-  danger: null,
-  accident: null,
+  danger: 60,
+  accident: 60,
   closure: null,
-  jam: null,
+  jam: 60,
   pothole: null,
   addr_noshow: null,
   addr_hard: null,
@@ -108,8 +110,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       votes_no INT NOT NULL DEFAULT 0
     );
     ALTER TABLE road_reports ALTER COLUMN expires DROP NOT NULL;
-    UPDATE road_reports SET expires = NULL
-      WHERE expires > NOW() AND type NOT IN ('police', 'radar');
+    UPDATE road_reports SET expires = NOW() + INTERVAL '60 minutes'
+      WHERE expires IS NULL AND type IN ('police', 'radar', 'danger', 'accident', 'jam');
     CREATE INDEX IF NOT EXISTS road_reports_expires ON road_reports (expires);
     CREATE TABLE IF NOT EXISTS report_votes (
       report_id BIGINT NOT NULL,
@@ -486,8 +488,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     } else {
       const no = await pool.query('SELECT COUNT(*) AS n FROM report_votes WHERE report_id = $1 AND NOT still', [id]);
       const n = Number(no.rows[0].n);
-      // Водитель подтвердил отсутствие — убираем сразу, сохраняя историю.
-      if (n >= 1) {
+      // Убираем, когда «Уже нет» сказали два разных водителя — или сам автор метки.
+      // Одно «нет» от случайного водителя метку не стирает.
+      if (n >= 2 || rep.device_id === deviceId) {
         await pool.query('UPDATE road_reports SET expires = NOW(), votes_no = $1 WHERE id = $2', [n, id]);
       } else {
         await pool.query('UPDATE road_reports SET votes_no = $1 WHERE id = $2', [n, id]);
@@ -609,8 +612,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   app.post('/api/places/delete', member(async (req, res, deviceId) => {
     const id = Number(req.body.id);
     if (!Number.isSafeInteger(id) || id <= 0) return res.json({ ok: false });
-    const r = await pool.query('UPDATE places SET hidden = true WHERE id = $1 AND NOT hidden', [id]);
-    res.json({ ok: r.rowCount > 0 });
+    // «Ваши точки» удаляет только автор (и администратор — в админке).
+    const r = await pool.query('UPDATE places SET hidden = true WHERE id = $1 AND device_id = $2 AND NOT hidden', [id, deviceId]);
+    res.json({ ok: r.rowCount > 0, message: r.rowCount > 0 ? undefined : 'Удалить может только тот, кто добавил' });
   }));
 
   // ---------- аэропорт ----------

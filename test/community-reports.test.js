@@ -23,23 +23,23 @@ function fixture() {
   }
   return { queries, call };
 }
-test('police/radar expire in one hour; other reports have no expiry', async () => {
+test('police/radar/danger/accident/jam expire in one hour; closure, pothole and address marks have no expiry', async () => {
   for (const type of ['police', 'radar', 'danger', 'accident', 'closure', 'jam', 'pothole', 'addr_noshow', 'addr_hard', 'addr_cancel']) {
     const f = fixture(), start = Date.now();
     const r = await f.call('/api/reports/add', { type, lat: 47.0, lon: 28.8 });
     assert.equal(r.result.ok, true);
     const expires = f.queries.find(q => q.sql.startsWith('INSERT INTO road_reports')).args[4];
-    if (['police', 'radar'].includes(type)) assert.ok(expires.getTime() - start >= 3600000 && expires.getTime() - start < 3601000);
+    if (['police', 'radar', 'danger', 'accident', 'jam'].includes(type)) assert.ok(expires.getTime() - start >= 3600000 && expires.getTime() - start < 3601000);
     else assert.equal(expires, null);
   }
 });
-test('a negative confirmation removes a permanent report; yes keeps it permanent', async () => {
+test('one negative vote from another driver does not remove; yes extends a one-hour report', async () => {
   for (const still of [false, true]) {
     const f = fixture();
     assert.equal((await f.call('/api/reports/vote', { id: 5, still })).result.ok, true);
     const update = f.queries.find(q => q.sql.startsWith('UPDATE road_reports SET expires'));
-    if (still) assert.equal(update.args[0], null);
-    else assert.ok(update.sql.includes('expires = NOW()'));
+    if (still) assert.ok(update.args[0] instanceof Date); // danger — час
+    else assert.equal(update, undefined); // n = 1, не автор — метка остаётся
   }
 });
 test('history is scoped to requesting device, not supplied author; unlicensed requests fail', async () => {
