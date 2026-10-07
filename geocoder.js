@@ -170,6 +170,38 @@ module.exports = function createGeocoder(pool) {
     return null;
   }
 
+  // OpenStreetMap: знает заведения по названию (Radisson Blu, Mall Dova, кафе), которых
+  // нет в геокодере Яндекса. Бесплатно, без ключа, но не чаще раза в секунду — запросы по очереди.
+  let osmChain = Promise.resolve();
+  function osm(text) {
+    const run = osmChain.then(async () => {
+      const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=3&countrycodes=md' +
+        '&viewbox=28.60,47.20,29.10,46.85&bounded=1&accept-language=ru&q=' + encodeURIComponent(text);
+      try {
+        const r = await fetch(url, { headers: { 'User-Agent': 'TaxiRadar-server/1.0' }, signal: AbortSignal.timeout(6000) });
+        if (!r.ok) return null;
+        const list = await r.json();
+        const p = list.map(x => ({ lat: Number(x.lat), lon: Number(x.lon) })).find(x => haversineKm(x, CENTER) <= MAX_FROM_CENTER_KM);
+        return p || null;
+      } catch (e) {
+        return null;
+      } finally {
+        await new Promise(res => setTimeout(res, 1100));
+      }
+    });
+    osmChain = run.catch(() => null);
+    return run;
+  }
+
+  /** Для админки: найти точку по любому тексту — адрес у Яндекса, название места в OpenStreetMap. */
+  async function findAny(text) {
+    const t = String(text || '').trim();
+    if (!t) return null;
+    const y = await askAnyKey(/кишин|chisin/i.test(t) ? t : 'Кишинёв, ' + t);
+    if (y && y.point) return y.point;
+    return await osm(t);
+  }
+
   async function askAnyKey(q) {
     for (const key of usableKeys()) {
       try {
@@ -236,7 +268,8 @@ module.exports = function createGeocoder(pool) {
     const job = (async () => {
       const answer = await askAnyKey(rawQuery);
       if (!answer) return row ? fromRow(row) : null;
-      const p = answer.point;
+      // Яндекс не нашёл (часто это название заведения) — пробуем OpenStreetMap.
+      const p = answer.point || await osm(rawQuery);
       await pool.query(
         `INSERT INTO geocode_cache (q, lat, lon, created, v) VALUES ($1, $2, $3, NOW(), $4)
          ON CONFLICT (q) DO UPDATE SET lat = $2, lon = $3, created = NOW(), v = $4`,
@@ -344,5 +377,5 @@ module.exports = function createGeocoder(pool) {
     };
   }
 
-  return { lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize };
+  return { lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize, findAny };
 };

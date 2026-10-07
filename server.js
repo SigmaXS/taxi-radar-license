@@ -127,6 +127,10 @@ app.use('/admin', requireAdmin);
 // Обновление прямо из приложения (APK в базе, загрузка на /admin/apk).
 const updates = require('./updates');
 updates.setup(app, pool);
+app.locals.latestVersion = updates.latestVersion;
+
+// Ошибки приложения (/admin/crashes) и сообщения водителям (/admin/messages).
+const notices = require('./notices')(app, pool, { isValidDeviceId, escapeHtml });
 
 app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
 
@@ -178,7 +182,9 @@ app.get('/api/app-config', (req, res) => {
     currency: process.env.CURRENCY || 'лей',
     surge_base: surgeBase(),
     // Загруженный на /admin/apk файл: версия, «что нового» и ссылка на скачивание.
-    ...updates.configFields('https://' + req.get('host'))
+    ...updates.configFields('https://' + req.get('host')),
+    // Сообщение водителям из админки (баннер на главной).
+    ...notices.configFields()
   });
 });
 
@@ -488,6 +494,11 @@ app.get('/admin/view-devices', async (req, res) => {
       </tr>`).join('');
 
     let totalDevices = 0, onlineDevices = 0, activeSubs = 0, expiredSubs = 0, bannedDevices = 0;
+    // Версии: кто сидит на старой (по device_info «… · v1.15»). Считаем только живые подписки.
+    const latest = updates.latestVersion();
+    const latestNum = (() => { const m = String(latest.name).match(/(\d+)\.(\d+)/); return m ? Number(m[1]) * 100 + Number(m[2]) : 0; })();
+    const versionCounts = new Map();
+    let outdated = 0;
 
     const devicesList = devicesQuery.rows.map(dev => {
       totalDevices++;
@@ -501,6 +512,14 @@ app.get('/admin/view-devices', async (req, res) => {
       else if (isDisabled || isExpired) expiredSubs++;
       else activeSubs++;
       if (isOnline) onlineDevices++;
+      const ver = versionOf(dev.device_info);
+      const old = latestNum > 0 && ver > 0 && ver < latestNum;
+      if (!isBanned && !isExpired && !isDisabled) {
+        const label = ver ? `${Math.floor(ver / 100)}.${ver % 100}` : '?';
+        versionCounts.set(label, (versionCounts.get(label) || 0) + 1);
+        if (old) outdated++;
+      }
+      const verBadge = ver ? `<span style="display:inline-block;margin-left:6px;padding:1px 7px;border-radius:10px;font-size:12px;font-weight:bold;${old ? 'background:#fed7d7;color:#c53030;' : 'background:#c6f6d5;color:#276749;'}">v${Math.floor(ver / 100)}.${ver % 100}${old ? ' устарела' : ''}</span>` : '';
 
       let statusHtml;
       if (isBanned) statusHtml = '<span style="color:#e53e3e;font-weight:bold;">● В бане</span>';
@@ -534,7 +553,7 @@ app.get('/admin/view-devices', async (req, res) => {
           <td style="white-space:nowrap;">${statusHtml}</td>
           <td><div style="font-weight:bold;">${escapeHtml(dev.key_code)}</div><div style="font-size:12px;color:#718096;">${escapeHtml(dev.type || '')}</div></td>
           <td>
-            <div style="font-weight:600;">${dev.device_info ? escapeHtml(dev.device_info) : '<span style="color:#a0aec0;">— старая версия приложения</span>'}</div>
+            <div style="font-weight:600;">${dev.device_info ? escapeHtml(dev.device_info) : '<span style="color:#a0aec0;">— старая версия приложения</span>'}${verBadge}</div>
             <code style="background:#feebc8;color:#c05621;padding:2px 6px;border-radius:4px;font-size:12px;">${escapeHtml(dev.device_id)}</code>
             ${refHtml}
           </td>
@@ -587,7 +606,7 @@ app.get('/admin/view-devices', async (req, res) => {
           <p><a href="/admin/apk" style="display:inline-block;padding:12px 18px;border-radius:12px;background:#FFCC00;color:#141414;font-weight:700;text-decoration:none">⬆️ Выпустить обновление приложения</a></p>
           <h2>📊 Аналитика и Статистика (PostgreSQL)</h2>
           ${req.query.msg ? `<p style="font-weight:bold;background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
-          <p><a href="/admin/community">💬 Чат, клиенты, метки на карте, аэропорт →</a></p>
+          <p><a href="/admin/community">💬 Чат, клиенты, метки на карте, аэропорт →</a> &nbsp;·&nbsp; <a href="/admin/messages">📣 Сообщение водителям</a> &nbsp;·&nbsp; <a href="/admin/crashes">🐞 Ошибки приложения</a></p>
           <div class="stats-grid">
             <div class="stat-box"><div>Всего устройств</div><div class="stat-num">${totalDevices}</div></div>
             <div class="stat-box"><div>⚡ Онлайн сейчас</div><div class="stat-num" style="color:#38a169;">${onlineDevices}</div></div>
@@ -596,7 +615,10 @@ app.get('/admin/view-devices', async (req, res) => {
             <div class="stat-box"><div>🚫 В бане</div><div class="stat-num" style="color:#e53e3e;">${bannedDevices}</div></div>
             <div class="stat-box"><div>🎁 Взяли триал</div><div class="stat-num">${escapeHtml(trialsQuery.rows[0].count)}</div></div>
             <div class="stat-box"><div>🤝 По рефералке</div><div class="stat-num">${referredDevices}</div></div>
+            <div class="stat-box"><div>⚠️ Старая версия</div><div class="stat-num" style="color:${outdated ? '#c53030' : '#38a169'};">${outdated}</div></div>
           </div>
+          <p style="font-size:13px;color:#4a5568;">Версии у активных (последняя ${escapeHtml(latest.name)}): ${[...versionCounts.entries()].sort((a, b) => b[0].localeCompare(a[0], undefined, { numeric: true })).map(([v, n]) => `<b>${escapeHtml(v)}</b> — ${n}`).join(' · ')}.
+          ${outdated ? ` Напомнить старым обновиться — <a href="/admin/messages">сообщением водителям</a> «только у кого версия старее» (видят 1.17+; 1.16 видит жёлтую плашку, если поднять MIN_VERSION_CODE).` : ''}</p>
         </div>
         <div class="card">
           <h2>🛠 Создать ключ</h2>

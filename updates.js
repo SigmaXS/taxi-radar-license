@@ -105,4 +105,10 @@ function configFields(base) {
   };
 }
 
-module.exports = { setup, configFields };
+/** Последняя версия: загруженный APK или переменные Railway. */
+function latestVersion() {
+  if (latest) return { code: latest.version_code, name: latest.version_name };
+  return { code: parseInt(process.env.LATEST_VERSION_CODE || '18', 10), name: process.env.LATEST_VERSION_NAME || '1.16' };
+}
+
+module.exports = { setup, configFields, latestVersion };

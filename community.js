@@ -771,8 +771,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           <td style="white-space:nowrap;">
             <form method="POST" action="/admin/community/address" style="display:inline;">
               <input type="hidden" name="q" value="${escapeHtml(m.text)}">
-              <input type="text" name="point" placeholder="47.0105, 28.8638" style="width:150px;">
-              <button name="action" value="set" style="${btn}background:#38a169;">Сохранить точку</button>
+              <input type="text" name="point" placeholder="Настоящий адрес или 47.0105, 28.8638" style="width:230px;">
+              <button name="action" value="set" style="${btn}background:#38a169;">Сохранить</button>
+              <button name="action" value="auto" style="${btn}background:#3182ce;" title="Поискать этот текст у Яндекса и в OpenStreetMap">Найти сам</button>
               <button name="action" value="dismiss" style="${btn}background:#718096;">Скрыть</button>
             </form>
           </td>
@@ -880,7 +881,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         </style></head><body>
         <div class="card"><a href="/admin/view-devices">← Устройства и ключи</a>${notice}</div>
         <div class="card"><h2>📍 Адреса, которые не нашлись (${addr.misses.length})</h2>
-          <p style="font-size:13px;color:#4a5568;">Яндекс не нашёл эти адреса — цена по ним не показывалась. Найдите место на карте, скопируйте координаты («47.0105, 28.8638») и сохраните — дальше адрес будет находиться у всех. Точки с поездок водителей добавляются сами.</p>
+          <p style="font-size:13px;color:#4a5568;">Эти адреса не нашлись — цена по ним не показывалась. Впишите рядом настоящий адрес («Mitropolit Varlaam 7») или координаты с карты и нажмите «Сохранить» — дальше адрес будет находиться у всех. «Найти сам» — поискать этот текст у Яндекса и в OpenStreetMap (там есть отели, кафе, ТЦ). Бессмысленный текст (не адрес) — «Скрыть».</p>
           <table><tr><th>Адрес с карточки</th><th>Раз</th><th>Последний</th><th></th></tr>${missRows || '<tr><td colspan="4">Все адреса находятся 👍</td></tr>'}</table>
           <h3 style="margin-top:20px;">Свои точки адресов ${countLine ? `<span style="font-weight:normal;font-size:13px;">— ${escapeHtml(countLine)}</span>` : ''}</h3>
           <form method="POST" action="/admin/community/address" style="margin-bottom:10px;">
@@ -939,6 +940,21 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         <div class="card"><h2>💬 Чат (последние 100)</h2>
           <table><tr><th>Время</th><th>Кто</th><th>Сообщение</th><th></th></tr>${chatRows || '<tr><td colspan="4">Сообщений пока нет</td></tr>'}</table>
         </div>
+        <script>
+          // Длинные таблицы свёрнуты: видно 2 строки, остальное — кнопкой «Развернуть».
+          document.querySelectorAll('table').forEach(t => {
+            const rows = [...t.querySelectorAll('tr')].filter(r => !r.querySelector('th'));
+            if (rows.length <= 3) return;
+            const hide = on => rows.slice(2).forEach(r => r.style.display = on ? 'none' : '');
+            const b = document.createElement('button');
+            b.style.cssText = 'margin-top:8px;border:0;padding:8px 14px;border-radius:6px;background:#2b6cb0;color:#fff;cursor:pointer;font-weight:bold;';
+            let folded = true;
+            const label = () => b.textContent = folded ? 'Развернуть — ещё ' + (rows.length - 2) : 'Свернуть';
+            b.onclick = () => { folded = !folded; hide(folded); label(); };
+            hide(true); label();
+            t.after(b);
+          });
+        </script>
       </body></html>`);
     } catch (err) {
       console.error(err);
@@ -967,16 +983,26 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     try {
       if (!q) {
         msg = 'Нужен адрес';
-      } else if (action === 'set') {
-        const m = String(req.body.point || '').match(/(-?\d+(?:\.\d+)?)\s*[,; ]\s*(-?\d+(?:\.\d+)?)/);
-        let lat = m ? Number(m[1]) : NaN, lon = m ? Number(m[2]) : NaN;
-        // Скопировали «долгота, широта» (как в ссылках Яндекса) — переставим.
-        if (lat < 40 && lon > 40) [lat, lon] = [lon, lat];
-        if (!(lat > 45 && lat < 49 && lon > 26 && lon < 31)) {
-          msg = 'Координаты не похожи на Молдову. Пример: 47.0105, 28.8638';
+      } else if (action === 'set' || action === 'auto') {
+        // В поле — координаты, обычный адрес («Mitropolit Varlaam 7») или пусто (= «Найти сам»).
+        const text = String(req.body.point || '').trim();
+        const m = text.match(/^\s*(-?\d+(?:\.\d+)?)\s*[,; ]\s*(-?\d+(?:\.\d+)?)\s*$/);
+        let lat = NaN, lon = NaN, how = '';
+        if (m && action === 'set') {
+          lat = Number(m[1]); lon = Number(m[2]);
+          // Скопировали «долгота, широта» (как в ссылках Яндекса) — переставим.
+          if (lat < 40 && lon > 40) [lat, lon] = [lon, lat];
+        } else {
+          const p = await geocoder.findAny(action === 'auto' || !text ? q : text);
+          if (p) { lat = p.lat; lon = p.lon; how = ` (нашлось по «${action === 'auto' || !text ? q : text}»)`; }
+        }
+        if (Number.isNaN(lat)) {
+          msg = 'Не нашлось. Впишите настоящий адрес (например «Mitropolit Varlaam 7») или координаты с карты';
+        } else if (!(lat > 45 && lat < 49 && lon > 26 && lon < 31)) {
+          msg = 'Точка не похожа на Молдову. Пример: 47.0105, 28.8638';
         } else {
           await geocoder.setAdminPoint(q, lat, lon);
-          msg = 'Точка сохранена: ' + q;
+          msg = `Точка сохранена: ${q}${how} — ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
         }
       } else if (action === 'remove') {
         await geocoder.removePoint(q);

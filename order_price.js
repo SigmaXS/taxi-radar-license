@@ -247,14 +247,12 @@ module.exports = function registerOrderPrice(app, { member, geocoder, clientSumm
     const r = await route([A, ...stops, B]).catch(() => null);
     if (!r) return res.json({ ok: false, reason: 'route', message: t('Маршрут не построился', 'Traseul nu s-a construit') });
 
-    // Пробки: таблица по поездкам всех водителей; нет данных — час пик +10 мин.
+    // Пробки: таблица по поездкам всех водителей; нет данных — без поправки
+    // («час пик +10 мин» убран: короткие поездки выходили вдвое дольше).
     const now = chisinauNow();
     const table = getTraffic();
     const factor = table ? (now.weekend ? table.we : table.wd)[now.hour] : null;
     let minutes = r.minutes * (factor || 1);
-    if (!factor && !now.weekend && ((now.hour >= 7 && now.hour < 10) || (now.hour >= 13 && now.hour < 19))) {
-      minutes += Math.min(10, minutes);
-    }
     let cityKm = r.city, outKm = r.out;
     const ourKm = cityKm + outKm;
     let distance = ourKm;
