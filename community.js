@@ -21,18 +21,18 @@ const NEGATIVE_MIN_DRIVERS = 2;
 const REPORT_TYPES = {
   police: 60,
   radar: 60,
-  danger: 60,
-  accident: 120,
-  closure: 12 * 60,
-  jam: 60,
-  pothole: 7 * 24 * 60,
-  addr_noshow: 90 * 24 * 60,
-  addr_hard: 90 * 24 * 60,
-  addr_cancel: 90 * 24 * 60
+  danger: null,
+  accident: null,
+  closure: null,
+  jam: null,
+  pothole: null,
+  addr_noshow: null,
+  addr_hard: null,
+  addr_cancel: null
 };
 
 // Места водителей: где поесть, помыть машину, заправиться и т. д. Живут, пока
-// их не удалят; три «не советую» больше, чем «советую», — место скрывается.
+// их явно не удалит водитель или администратор. Оценки не удаляют место автоматически.
 const PLACE_TYPES = ['food', 'wash', 'fuel', 'coffee', 'wc', 'tire', 'parking'];
 
 // Стоянка такси у аэропорта Кишинёва: «в очереди», если телефон пинговал недавно.
@@ -107,6 +107,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       expires TIMESTAMP NOT NULL,
       votes_no INT NOT NULL DEFAULT 0
     );
+    ALTER TABLE road_reports ALTER COLUMN expires DROP NOT NULL;
+    UPDATE road_reports SET expires = NULL
+      WHERE expires > NOW() AND type NOT IN ('police', 'radar');
     CREATE INDEX IF NOT EXISTS road_reports_expires ON road_reports (expires);
     CREATE TABLE IF NOT EXISTS report_votes (
       report_id BIGINT NOT NULL,
@@ -407,7 +410,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
               v.still AS my_vote
        FROM road_reports r
        LEFT JOIN report_votes v ON v.report_id = r.id AND v.device_id = $5
-       WHERE r.expires > NOW() AND r.lat BETWEEN $1 AND $2 AND r.lon BETWEEN $3 AND $4
+       WHERE (r.expires IS NULL OR r.expires > NOW()) AND r.lat BETWEEN $1 AND $2 AND r.lon BETWEEN $3 AND $4
        ORDER BY r.created DESC LIMIT 300`,
       [lat - 0.27, lat + 0.27, lon - 0.4, lon + 0.4, deviceId]
     )).rows;
@@ -425,23 +428,36 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     });
   }));
 
+  // История принадлежит только авторизованному устройству, включая снятые метки.
+  app.post('/api/reports/mine', member(async (req, res, deviceId) => {
+    const rows = (await pool.query(
+      `SELECT id, type, lat, lon, created,
+              (expires IS NULL OR expires > NOW()) AS active
+       FROM road_reports WHERE device_id = $1 ORDER BY created DESC LIMIT 100`, [deviceId]
+    )).rows;
+    res.json({ ok: true, reports: rows.map(r => ({
+      id: Number(r.id), type: r.type, lat: r.lat, lon: r.lon,
+      created: new Date(r.created).toISOString(), mine: true, voted: false, active: r.active
+    })) });
+  }));
+
   app.post('/api/reports/add', member(async (req, res, deviceId) => {
     const type = req.body.type;
     const lat = Number(req.body.lat), lon = Number(req.body.lon);
     const ttl = REPORT_TYPES[type];
-    if (!ttl || !validPoint(lat, lon)) return res.json({ ok: false, message: 'Неверная метка' });
+    if (!Object.hasOwn(REPORT_TYPES, type) || !validPoint(lat, lon)) return res.json({ ok: false, message: 'Неверная метка' });
     if (tooOften('report:' + deviceId, 10, 60 * 60 * 1000)) {
       return res.json({ ok: false, message: 'Не больше 10 меток в час' });
     }
     // Такая же метка рядом (~150 м) уже есть — продлеваем её, а не плодим копии.
     const near = await pool.query(
-      `SELECT id FROM road_reports WHERE type = $1 AND expires > NOW()
+      `SELECT id FROM road_reports WHERE type = $1 AND (expires IS NULL OR expires > NOW())
        AND ABS(lat - $2) < 0.00135 AND ABS(lon - $3) < 0.002 LIMIT 1`,
       [type, lat, lon]
     );
-    const expires = new Date(Date.now() + ttl * 60 * 1000);
+    const expires = ttl === null ? null : new Date(Date.now() + ttl * 60 * 1000);
     if (near.rows.length) {
-      await pool.query('UPDATE road_reports SET expires = GREATEST(expires, $1), votes_no = 0 WHERE id = $2', [expires, near.rows[0].id]);
+      await pool.query('UPDATE road_reports SET expires = CASE WHEN $1::timestamp IS NULL THEN NULL ELSE GREATEST(expires, $1) END, votes_no = 0 WHERE id = $2', [expires, near.rows[0].id]);
       return res.json({ ok: true, id: Number(near.rows[0].id), extended: true });
     }
     const r = await pool.query(
@@ -451,11 +467,12 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true, id: Number(r.rows[0].id) });
   }));
 
-  // «Ещё здесь?» — да продлевает метку, два «нет» от разных водителей убирают её.
+  // «Да» продлевает полицию/радар на час. Остальные метки бессрочные; «Нет» убирает метку.
   app.post('/api/reports/vote', member(async (req, res, deviceId) => {
-    const id = parseInt(req.body.id, 10);
+    const id = Number(req.body.id);
     const still = req.body.still === true;
-    const rep = (await pool.query('SELECT type, device_id FROM road_reports WHERE id = $1', [id])).rows[0];
+    if (!Number.isSafeInteger(id) || id <= 0 || typeof req.body.still !== 'boolean') return res.json({ ok: false, message: 'Неверное подтверждение' });
+    const rep = (await pool.query('SELECT type, device_id FROM road_reports WHERE id = $1 AND (expires IS NULL OR expires > NOW())', [id])).rows[0];
     if (!rep) return res.json({ ok: false, message: 'Метка уже исчезла' });
     await pool.query(
       `INSERT INTO report_votes (report_id, device_id, still) VALUES ($1, $2, $3)
@@ -463,13 +480,14 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       [id, deviceId, still]
     );
     if (still) {
-      const expires = new Date(Date.now() + REPORT_TYPES[rep.type] * 60 * 1000);
-      await pool.query('UPDATE road_reports SET expires = GREATEST(expires, $1) WHERE id = $2', [expires, id]);
+      const ttl = REPORT_TYPES[rep.type];
+      const expires = ttl === null ? null : new Date(Date.now() + ttl * 60 * 1000);
+      await pool.query('UPDATE road_reports SET expires = CASE WHEN $1::timestamp IS NULL THEN NULL ELSE GREATEST(expires, $1) END WHERE id = $2 AND (expires IS NULL OR expires > NOW())', [expires, id]);
     } else {
       const no = await pool.query('SELECT COUNT(*) AS n FROM report_votes WHERE report_id = $1 AND NOT still', [id]);
       const n = Number(no.rows[0].n);
-      // Автор сам сказал «нет» — убираем сразу.
-      if (n >= 2 || rep.device_id === deviceId) {
+      // Водитель подтвердил отсутствие — убираем сразу, сохраняя историю.
+      if (n >= 1) {
         await pool.query('UPDATE road_reports SET expires = NOW(), votes_no = $1 WHERE id = $2', [n, id]);
       } else {
         await pool.query('UPDATE road_reports SET votes_no = $1 WHERE id = $2', [n, id]);
@@ -540,7 +558,6 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({
       ok: true,
       places: rows
-        .filter(r => !(Number(r.down) >= 3 && Number(r.down) > Number(r.up)))
         .map(r => ({
           id: Number(r.id), type: r.type, name: r.name, note: r.note, lat: r.lat, lon: r.lon,
           up: Number(r.up), down: Number(r.down), mine: r.device_id === deviceId,
@@ -588,9 +605,11 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true });
   }));
 
-  // Удалить может только автор (и админ — в админке).
+  // Любой подписчик может подтвердить, что места уже нет. Удаление сохраняется в базе.
   app.post('/api/places/delete', member(async (req, res, deviceId) => {
-    const r = await pool.query('UPDATE places SET hidden = true WHERE id = $1 AND device_id = $2', [parseInt(req.body.id, 10), deviceId]);
+    const id = Number(req.body.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.json({ ok: false });
+    const r = await pool.query('UPDATE places SET hidden = true WHERE id = $1 AND NOT hidden', [id]);
     res.json({ ok: r.rowCount > 0 });
   }));
 
@@ -719,7 +738,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
          ORDER BY m.id DESC LIMIT 100`
       )).rows;
       const reports = (await pool.query(
-        'SELECT id, device_id, type, lat, lon, created, expires, votes_no FROM road_reports WHERE expires > NOW() ORDER BY created DESC LIMIT 200'
+        'SELECT id, device_id, type, lat, lon, created, expires, votes_no FROM road_reports WHERE (expires IS NULL OR expires > NOW()) ORDER BY created DESC LIMIT 200'
       )).rows;
       const tagStats = (await pool.query(
         'SELECT tag, COUNT(*) AS n, COUNT(DISTINCT phone_hash) AS phones FROM client_tags GROUP BY tag ORDER BY n DESC'
@@ -803,7 +822,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           <td>${escapeHtml(r.type)}</td>
           <td><a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=16" target="_blank">${r.lat.toFixed(5)}, ${r.lon.toFixed(5)}</a></td>
           <td>${escapeHtml(fmt(r.created))}</td>
-          <td>${escapeHtml(fmt(r.expires))}</td>
+          <td>${r.expires === null ? 'До удаления' : escapeHtml(fmt(r.expires))}</td>
           <td><code style="font-size:11px;">${escapeHtml(r.device_id)}</code></td>
           <td>
             <form method="POST" action="/admin/community/report" style="display:inline;">
