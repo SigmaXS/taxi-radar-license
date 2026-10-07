@@ -55,6 +55,8 @@ module.exports = function createGeocoder(pool) {
       hits INT NOT NULL DEFAULT 0
     );
     ALTER TABLE geocode_cache ADD COLUMN IF NOT EXISTS v INT NOT NULL DEFAULT 1;
+    -- approx: Яндекс нашёл только улицу/район, а не дом, или точка из OpenStreetMap.
+    ALTER TABLE geocode_cache ADD COLUMN IF NOT EXISTS approx BOOLEAN NOT NULL DEFAULT false;
     CREATE TABLE IF NOT EXISTS address_points (
       q VARCHAR(300) PRIMARY KEY,
       lat DOUBLE PRECISION NOT NULL,
@@ -129,7 +131,8 @@ module.exports = function createGeocoder(pool) {
       return { lat, lon, precision: meta.precision };
     }).filter(p => haversineKm(p, CENTER) <= MAX_FROM_CENTER_KM);
     const best = points.find(p => GOOD_PRECISION.includes(p.precision)) || points[0];
-    return best ? { lat: best.lat, lon: best.lon } : null;
+    // approx — дом не найден: точка на улице или в районе.
+    return best ? { lat: best.lat, lon: best.lon, approx: !GOOD_PRECISION.includes(best.precision) } : null;
   }
 
   // Поиск на карте: несколько вариантов рядом с водителем. «Штефан чел маре 10»
@@ -265,22 +268,22 @@ module.exports = function createGeocoder(pool) {
     const known = builtin(q);
     if (known) return known;
     const own = (await pool.query('SELECT lat, lon, n, source FROM address_points WHERE q = $1', [q])).rows[0];
-    if (own && (own.source === 'admin' || own.n >= 2)) return { found: true, lat: own.lat, lon: own.lon };
+    if (own && (own.source === 'admin' || own.n >= 2)) return { found: true, lat: own.lat, lon: own.lon, approx: false };
     const r = await lookupYandex(rawQuery, q);
-    if (own && (!r || !r.found)) return { found: true, lat: own.lat, lon: own.lon };
+    if (own && (!r || !r.found)) return { found: true, lat: own.lat, lon: own.lon, approx: true };
     return r;
   }
 
   async function lookupYandex(rawQuery, q) {
     const cached = await pool.query(
-      `SELECT lat, lon, v FROM geocode_cache
+      `SELECT lat, lon, v, approx FROM geocode_cache
        WHERE q = $1 AND (
          (lat IS NOT NULL AND created > NOW() - ($2 || ' days')::INTERVAL) OR
          (lat IS NULL AND created > NOW() - ($3 || ' hours')::INTERVAL))`,
       [q, String(FOUND_DAYS), String(NOT_FOUND_HOURS)]
     );
     const row = cached.rows[0];
-    const fromRow = r => r.lat == null ? { found: false } : { found: true, lat: r.lat, lon: r.lon };
+    const fromRow = r => r.lat == null ? { found: false } : { found: true, lat: r.lat, lon: r.lon, approx: !!r.approx };
     if (row && row.v >= CACHE_VERSION) {
       cacheHits++;
       pool.query('UPDATE geocode_cache SET hits = hits + 1 WHERE q = $1', [q]).catch(() => {});
@@ -294,13 +297,14 @@ module.exports = function createGeocoder(pool) {
       const answer = await askAnyKey(rawQuery);
       if (!answer) return row ? fromRow(row) : null;
       // Яндекс не нашёл (часто это название заведения) — пробуем OpenStreetMap.
-      const p = answer.point || await osm(rawQuery);
+      // Яндекс не нашёл (часто это название заведения) — OpenStreetMap; его точку считаем приблизительной.
+      const p = answer.point || (await osm(rawQuery).then(x => x && { ...x, approx: true }));
       await pool.query(
-        `INSERT INTO geocode_cache (q, lat, lon, created, v) VALUES ($1, $2, $3, NOW(), $4)
-         ON CONFLICT (q) DO UPDATE SET lat = $2, lon = $3, created = NOW(), v = $4`,
-        [q, p ? p.lat : null, p ? p.lon : null, CACHE_VERSION]
+        `INSERT INTO geocode_cache (q, lat, lon, created, v, approx) VALUES ($1, $2, $3, NOW(), $4, $5)
+         ON CONFLICT (q) DO UPDATE SET lat = $2, lon = $3, created = NOW(), v = $4, approx = $5`,
+        [q, p ? p.lat : null, p ? p.lon : null, CACHE_VERSION, !!(p && p.approx)]
       );
-      return p ? { found: true, lat: p.lat, lon: p.lon } : { found: false };
+      return p ? { found: true, lat: p.lat, lon: p.lon, approx: !!p.approx } : { found: false };
     })();
     inFlight.set(q, job);
     try {

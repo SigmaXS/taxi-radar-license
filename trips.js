@@ -132,14 +132,18 @@ module.exports = function setupTrips(app, pool, { member, escapeHtml }) {
     const reason = String(req.body.reason || '').slice(0, 40);
     const comment = String(req.body.comment || '').trim().slice(0, 300);
     const r = await pool.query(
-      `UPDATE trip_reports SET disputed = NOW(), dispute_reason = $3, dispute_comment = $4, dispute_done = false
+      `UPDATE trip_reports SET disputed = NOW(), dispute_reason = $3, dispute_comment = $4, dispute_done = false, dispute_status = 'received'
        WHERE id = $1 AND device_id = $2`, [parseInt(req.body.id, 10) || 0, deviceId, reason || null, comment || null]);
     const t = (await pool.query('SELECT * FROM trip_reports WHERE id = $1', [parseInt(req.body.id, 10) || 0])).rows[0];
     res.json({ ok: r.rowCount > 0, diagnosis: t ? diagnose(t).title : '' });
   }));
 
+  // Итог разбора — водитель видит его в «Моих поездках». «Нужен скриншот» оставляет обращение открытым.
+  const STATUSES = ['fixed_address', 'correct', 'need_info', 'checked'];
   app.post('/admin/trips/dispute', async (req, res) => {
-    await pool.query('UPDATE trip_reports SET dispute_done = true WHERE id = $1', [parseInt(req.body.id, 10) || 0]);
+    const status = STATUSES.includes(req.body.status) ? req.body.status : 'checked';
+    await pool.query('UPDATE trip_reports SET dispute_status = $2, dispute_done = $3 WHERE id = $1',
+      [parseInt(req.body.id, 10) || 0, status, status !== 'need_info']);
     res.redirect('/admin/trips');
   });
 
@@ -196,8 +200,10 @@ module.exports = function setupTrips(app, pool, { member, escapeHtml }) {
             <span style="font-size:12px;color:#718096;">${escapeHtml(REASONS[t.dispute_reason] || '')}${t.dispute_comment ? ` — «${escapeHtml(t.dispute_comment)}»` : ''}</span></td>
           <td><b>${escapeHtml(d.title)}</b><br><span style="font-size:13px;">${escapeHtml(d.fix)}</span>
             ${d.code === 'address' ? pointForm('А', t.route_from) + pointForm('Б', t.route_to) : ''}</td>
-          <td><form method="POST" action="/admin/trips/dispute" style="margin:0;"><input type="hidden" name="id" value="${t.id}">
-            <button style="border:0;padding:8px 12px;border-radius:6px;background:#718096;color:#fff;cursor:pointer;">Разобрано</button></form></td>
+          <td style="white-space:nowrap;"><form method="POST" action="/admin/trips/dispute" style="margin:0;display:grid;gap:4px;"><input type="hidden" name="id" value="${t.id}">
+            ${[['fixed_address', 'Адрес исправлен', '#38a169'], ['correct', 'Расчёт верный', '#3182ce'], ['need_info', 'Нужен скриншот', '#dd6b20'], ['checked', 'Проверено', '#718096']]
+              .map(([v, l, c]) => `<button name="status" value="${v}" style="border:0;padding:7px 10px;border-radius:6px;background:${c};color:#fff;cursor:pointer;">${l}</button>`).join('')}
+            ${t.dispute_status === 'need_info' ? '<span style="font-size:12px;color:#dd6b20;">ждём скриншот</span>' : ''}</form></td>
         </tr>`;
       }).join('');
       const placeRows = places.map(p => `<tr><td>${escapeHtml(p.place)}</td><td>${p.n}</td><td>${lei(p.ap)}</td><td>${Number(p.dp) > 0 ? '+' : ''}${lei(p.dp)}</td></tr>`).join('');

@@ -35,7 +35,8 @@ const REPORT_TYPES = {
 
 // Места водителей: где поесть, помыть машину, заправиться и т. д. Живут, пока
 // их явно не удалит водитель или администратор. Оценки не удаляют место автоматически.
-const PLACE_TYPES = ['food', 'wash', 'fuel', 'coffee', 'wc', 'tire', 'parking'];
+// pump — где есть насос (подкачать шины).
+const PLACE_TYPES = ['food', 'wash', 'fuel', 'coffee', 'wc', 'tire', 'parking', 'pump'];
 
 // Стоянка такси у аэропорта Кишинёва: «в очереди», если телефон пинговал недавно.
 const AIRPORT_QUEUE_MINUTES = 5;
@@ -92,6 +93,10 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       good BOOLEAN NOT NULL,
       PRIMARY KEY (place_id, device_id)
     );
+    -- Часы работы, примерная цена и когда место последний раз подтверждали.
+    ALTER TABLE places ADD COLUMN IF NOT EXISTS hours VARCHAR(40) NOT NULL DEFAULT '';
+    ALTER TABLE places ADD COLUMN IF NOT EXISTS price VARCHAR(40) NOT NULL DEFAULT '';
+    ALTER TABLE place_votes ADD COLUMN IF NOT EXISTS at TIMESTAMP NOT NULL DEFAULT NOW();
     CREATE TABLE IF NOT EXISTS client_reviews (
       phone_hash CHAR(64) NOT NULL,
       device_id VARCHAR(100) NOT NULL,
@@ -548,7 +553,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     const lat = Number(req.body.lat), lon = Number(req.body.lon);
     if (!validPoint(lat, lon)) return res.json({ ok: true, places: [] });
     const rows = (await pool.query(
-      `SELECT p.id, p.type, p.name, p.note, p.lat, p.lon, p.device_id,
+      `SELECT p.id, p.type, p.name, p.note, p.lat, p.lon, p.device_id, p.hours, p.price,
+              FLOOR(EXTRACT(EPOCH FROM NOW() - GREATEST(p.created, MAX(v.at) FILTER (WHERE v.good))) / 86400) AS confirmed_age,
               COUNT(v.*) FILTER (WHERE v.good) AS up,
               COUNT(v.*) FILTER (WHERE NOT v.good) AS down,
               BOOL_OR(v.device_id = $5 AND v.good) AS my_up,
@@ -564,6 +570,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         .map(r => ({
           id: Number(r.id), type: r.type, name: r.name, note: r.note, lat: r.lat, lon: r.lon,
           up: Number(r.up), down: Number(r.down), mine: r.device_id === deviceId,
+          hours: r.hours || '', price: r.price || '',
+          // Сколько дней назад место подтверждали (добавили или поставили «советую»).
+          confirmed_days: r.confirmed_age == null ? null : Math.max(0, Number(r.confirmed_age)),
           vote: r.my_up ? 1 : r.my_down ? -1 : 0
         }))
     });
@@ -574,6 +583,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     const lat = Number(req.body.lat), lon = Number(req.body.lon);
     const name = cleanText(req.body.name, 60);
     const note = cleanText(req.body.note, 200).replace(/https?:\/\/\S+|www\.\S+/gi, '…');
+    const hours = cleanText(req.body.hours, 40);
+    const price = cleanText(req.body.price, 40);
     if (!PLACE_TYPES.includes(type) || !validPoint(lat, lon) || !name) {
       return res.json({ ok: false, message: 'Укажите тип и название' });
     }
@@ -581,8 +592,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       return res.json({ ok: false, message: 'Не больше 10 мест в сутки' });
     }
     const r = await pool.query(
-      'INSERT INTO places (device_id, type, name, note, lat, lon) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-      [deviceId, type, name, note, lat, lon]
+      'INSERT INTO places (device_id, type, name, note, lat, lon, hours, price) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
+      [deviceId, type, name, note, lat, lon, hours, price]
     );
     // Автор — сразу «советую».
     await pool.query('INSERT INTO place_votes (place_id, device_id, good) VALUES ($1, $2, true)', [r.rows[0].id, deviceId]);
@@ -600,8 +611,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       await pool.query('DELETE FROM place_votes WHERE place_id = $1 AND device_id = $2', [id, deviceId]);
     } else {
       await pool.query(
-        `INSERT INTO place_votes (place_id, device_id, good) VALUES ($1, $2, $3)
-         ON CONFLICT (place_id, device_id) DO UPDATE SET good = $3`,
+        `INSERT INTO place_votes (place_id, device_id, good, at) VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (place_id, device_id) DO UPDATE SET good = $3, at = NOW()`,
         [id, deviceId, vote > 0]
       );
     }
