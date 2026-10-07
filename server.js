@@ -131,6 +131,8 @@ app.locals.latestVersion = updates.latestVersion;
 
 // Ошибки приложения (/admin/crashes) и сообщения водителям (/admin/messages).
 const notices = require('./notices')(app, pool, { isValidDeviceId, escapeHtml });
+// Недельная сводка (/admin/weekly, в Telegram по понедельникам).
+require('./weekly')(app, pool, { escapeHtml, latestVersion: updates.latestVersion });
 
 app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
 

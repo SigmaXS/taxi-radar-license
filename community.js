@@ -1005,7 +1005,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       console.error(err);
       msg = 'Ошибка';
     }
-    res.redirect('/admin/community' + (msg ? '?msg=' + encodeURIComponent(msg) : ''));
+    const back = /^\/admin\/[a-z-]+$/.test(String(req.body.back || '')) ? req.body.back : '/admin/community';
+    res.redirect(back + (msg ? '?msg=' + encodeURIComponent(msg) : ''));
   });
 
   app.post('/admin/community/review', async (req, res) => {
