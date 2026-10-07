@@ -124,6 +124,10 @@ function requireAdmin(req, res, next) {
 
 app.use('/admin', requireAdmin);
 
+// Обновление прямо из приложения (APK в базе, загрузка на /admin/apk).
+const updates = require('./updates');
+updates.setup(app, pool);
+
 app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
 
 function referralBonusDays() {
@@ -172,7 +176,9 @@ app.get('/api/app-config', (req, res) => {
     // Тарифы на экране «Подписка»: JSON вида [{"days":30,"price":99}]
     tariffs: parseTariffs(),
     currency: process.env.CURRENCY || 'лей',
-    surge_base: surgeBase()
+    surge_base: surgeBase(),
+    // Загруженный на /admin/apk файл: версия, «что нового» и ссылка на скачивание.
+    ...updates.configFields('https://' + req.get('host'))
   });
 });
 
@@ -578,6 +584,7 @@ app.get('/admin/view-devices', async (req, res) => {
       </head>
       <body>
         <div class="card">
+          <p><a href="/admin/apk" style="display:inline-block;padding:12px 18px;border-radius:12px;background:#FFCC00;color:#141414;font-weight:700;text-decoration:none">⬆️ Выпустить обновление приложения</a></p>
           <h2>📊 Аналитика и Статистика (PostgreSQL)</h2>
           ${req.query.msg ? `<p style="font-weight:bold;background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
           <p><a href="/admin/community">💬 Чат, клиенты, метки на карте, аэропорт →</a></p>
