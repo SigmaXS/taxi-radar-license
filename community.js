@@ -721,6 +721,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
 
   const geocoder = require('./geocoder')(pool);
 
+  // События (концерты, матчи): /admin/events и /api/events/list.
+  require('./events')(app, pool, { member, escapeHtml, geocoder });
+
   // Цена заказа по тексту снимка — для iPhone (фоновое действие «Быстрых команд»).
   require('./order_price')(app, {
     member, geocoder, clientSummary, phoneHash, tooOften,

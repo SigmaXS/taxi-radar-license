@@ -4,6 +4,7 @@ const TABS = [
   ['/admin/view-devices', '📱 Устройства'],
   ['/admin/trips', '🚕 Поездки'],
   ['/admin/community', '💬 Сообщество'],
+  ['/admin/events', '🎫 События'],
   ['/admin/messages', '📣 Сообщения'],
   ['/admin/weekly', '📊 Сводка'],
   ['/admin/crashes', '🐞 Ошибки'],
