@@ -124,6 +124,21 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       still BOOLEAN NOT NULL,
       PRIMARY KEY (report_id, device_id)
     );
+    -- Очередь в аэропорту с экрана Яндекс Про: тариф, ожидание, место водителя («31 - 35»).
+    CREATE TABLE IF NOT EXISTS airport_queue (
+      device_id VARCHAR(100) NOT NULL,
+      tariff VARCHAR(20) NOT NULL,
+      wait_min INT,
+      place_from INT,
+      place_to INT,
+      at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (device_id, tariff)
+    );
+    CREATE TABLE IF NOT EXISTS airport_queue_raw (
+      id BIGSERIAL PRIMARY KEY,
+      text VARCHAR(3000) NOT NULL,
+      at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS airport_presence (
       device_id VARCHAR(100) PRIMARY KEY,
       last_seen TIMESTAMP NOT NULL
@@ -640,12 +655,60 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true });
   }));
 
+  // Водитель в аэропорту открыл «Ожидание в очереди» (или свернул Яндекс Про с этой строкой).
+  app.post('/api/airport/queue', member(async (req, res, deviceId) => {
+    if (tooOften('aq:' + deviceId, 40, 3600 * 1000)) return res.json({ ok: false });
+    const list = Array.isArray(req.body.readings) ? req.body.readings.slice(0, 3) : [];
+    for (const r of list) {
+      if (!['econom', 'comfort', 'comfortplus'].includes(r.tariff)) continue;
+      const wait = Number.isInteger(r.wait_min) && r.wait_min >= 0 && r.wait_min <= 720 ? r.wait_min : null;
+      const from = Number.isInteger(r.place_from) && r.place_from > 0 && r.place_from < 1000 ? r.place_from : null;
+      const to = Number.isInteger(r.place_to) && r.place_to >= (from || 0) && r.place_to < 1000 ? r.place_to : from;
+      if (wait == null && from == null) continue;
+      // Свёрнутый виджет даёт только время — место оставляем прежним, если оно свежее.
+      await pool.query(
+        `INSERT INTO airport_queue (device_id, tariff, wait_min, place_from, place_to, at) VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (device_id, tariff) DO UPDATE SET wait_min = COALESCE($3, airport_queue.wait_min),
+           place_from = CASE WHEN $4::int IS NULL AND airport_queue.at > NOW() - INTERVAL '30 minutes' THEN airport_queue.place_from ELSE $4 END,
+           place_to = CASE WHEN $5::int IS NULL AND airport_queue.at > NOW() - INTERVAL '30 minutes' THEN airport_queue.place_to ELSE $5 END,
+           at = NOW()`,
+        [deviceId, r.tariff, wait, from, to]);
+    }
+    if (req.body.raw) {
+      await pool.query('INSERT INTO airport_queue_raw (text) VALUES ($1)', [cleanText(req.body.raw, 3000)]);
+      await pool.query('DELETE FROM airport_queue_raw WHERE id NOT IN (SELECT id FROM airport_queue_raw ORDER BY id DESC LIMIT 20)');
+    }
+    res.json({ ok: true });
+  }));
+
+  /**
+   * Сводка очереди по тарифам за последние 30 минут. Длина очереди ≈ самое дальнее место
+   * среди свежих отметок (кто встал последним — в конце); ожидание — у той же отметки.
+   */
+  async function queueSummary() {
+    const rows = (await pool.query(
+      `SELECT tariff, wait_min, place_from, place_to, EXTRACT(EPOCH FROM NOW() - at) / 60 AS age
+       FROM airport_queue WHERE at > NOW() - INTERVAL '30 minutes'`)).rows;
+    const out = {};
+    for (const t of ['econom', 'comfort', 'comfortplus']) {
+      const mine = rows.filter(r => r.tariff === t);
+      if (!mine.length) { out[t] = null; continue; }
+      const withPlace = mine.filter(r => r.place_to != null).sort((a, b) => b.place_to - a.place_to);
+      const top = withPlace[0] || mine.sort((a, b) => a.age - b.age)[0];
+      out[t] = {
+        cars_from: top.place_from, cars_to: top.place_to, wait_min: top.wait_min,
+        age_min: Math.round(Math.min(...mine.map(r => Number(r.age)))), drivers: mine.length
+      };
+    }
+    return out;
+  }
+
   app.post('/api/airport/status', member(async (req, res) => {
     const q = await pool.query(
       `SELECT COUNT(*) AS n FROM airport_presence WHERE last_seen > NOW() - ($1 || ' minutes')::INTERVAL`,
       [String(AIRPORT_QUEUE_MINUTES)]
     );
-    res.json({ ok: true, queue: Number(q.rows[0].n), flights: await airportBoard.flights() });
+    res.json({ ok: true, queue: Number(q.rows[0].n), taxi_queue: await queueSummary(), flights: await airportBoard.flights() });
   }));
 
   // ---------- табло прилётов (см. airport.js) ----------
@@ -791,6 +854,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         [String(AIRPORT_QUEUE_MINUTES)]
       )).rows[0].n;
       const fmt = d => new Date(d).toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau' });
+      const taxiQueue = await queueSummary();
+      const queueRaw = (await pool.query('SELECT text, at FROM airport_queue_raw ORDER BY id DESC LIMIT 10')).rows;
       const btn = 'border:none;padding:4px 8px;border-radius:4px;color:#fff;cursor:pointer;';
       const addr = await geocoder.adminData();
       const lei = v => v == null ? '—' : `${Math.round(Number(v))} L`;
@@ -916,7 +981,15 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           <table><tr><th>Адрес</th><th>Точка</th><th>Откуда</th><th></th></tr>${pointRows || '<tr><td colspan="4">Пока нет</td></tr>'}</table>
         </div>
         <div class="card"><h2>🚕 Поездки и точность цены</h2><p>Перенесены на вкладку <a href="/admin/trips">«Поездки»</a>.</p></div>
-        <div class="card"><h2>✈️ Аэропорт</h2><p>Сейчас в очереди водителей радара: <b>${escapeHtml(queue)}</b></p></div>
+        <div class="card"><h2>✈️ Аэропорт</h2><p>Сейчас в очереди водителей радара: <b>${escapeHtml(queue)}</b></p>
+          ${(() => {
+            const names = { econom: 'Эконом', comfort: 'Комфорт', comfortplus: 'Комфорт+' };
+            return '<p>' + Object.entries(taxiQueue).map(([k, v]) => `${names[k]}: ${v ? `место ${v.cars_from ?? '?'}–${v.cars_to ?? '?'}, ожидание ${v.wait_min ?? '?'} мин, ${v.age_min} мин назад (${v.drivers} вод.)` : 'нет свежих данных'}`).join('<br>') + '</p>';
+          })()}
+          <h3>Тексты экрана очереди (последние)</h3>
+          <p style="font-size:13px;color:#4a5568;">Что радар видел на экране «Ожидание в очереди» — по ним проверяем, правильно ли читаются цифры.</p>
+          <table><tr><th>Когда</th><th>Текст</th></tr>${queueRaw.map(r => `<tr><td style="white-space:nowrap;">${escapeHtml(fmt(r.at))}</td><td style="font-size:12px;">${escapeHtml(r.text)}</td></tr>`).join('') || '<tr><td colspan="2">Пока не было</td></tr>'}</table>
+        </div>
         <div class="card"><h2>👤 Клиенты</h2>
           <p>Номера в базе не хранятся — только зашифрованные отпечатки. Проверить или очистить номер можно, только введя его.</p>
           <ul>${tagRows || '<li>Отметок пока нет</li>'}</ul>
