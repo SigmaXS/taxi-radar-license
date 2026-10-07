@@ -701,27 +701,36 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     const estPrice = num(b.est_price, 1, 20000);
     if (estPrice == null) return res.json({ ok: false });
     const r = await pool.query(
-      `INSERT INTO trip_reports (tariff, stops, surge, est_price, est_km, est_min, nav_km, nav_min, nav_price)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      `INSERT INTO trip_reports (tariff, stops, surge, est_price, est_km, est_min, nav_km, nav_min, nav_price, device_id, route_from, route_to)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
       [cleanText(b.tariff, 20) || '?', num(b.stops, 0, 10) || 0, num(b.surge, 0, 5000) || 0, estPrice,
         num(b.est_km, 0, 1000) || 0, num(b.est_min, 0, 1000) || 0,
-        num(b.nav_km, 0, 1000), num(b.nav_min, 0, 1000), num(b.nav_price, 1, 20000)]
+        num(b.nav_km, 0, 1000), num(b.nav_min, 0, 1000), num(b.nav_price, 1, 20000),
+        // Для «Моих поездок» водителя (адреса хранятся 60 дней, см. trips.js).
+        deviceId, cleanText(b.from, 120) || null, cleanText(b.to, 120) || null]
     );
     res.json({ ok: true, id: String(r.rows[0].id) });
   }));
 
   // Поездка закончилась: цена, км и минуты, которые показал Яндекс Про.
-  app.post('/api/trips/finish', member(async (req, res) => {
+  app.post('/api/trips/finish', member(async (req, res, deviceId) => {
     const b = req.body;
     await pool.query(
       `UPDATE trip_reports SET real_price = $2, real_km = $3, real_min = $4, note = $5, finished = NOW()
-       WHERE id = $1 AND finished IS NULL AND created > NOW() - INTERVAL '6 hours'`,
+       WHERE id = $1 AND finished IS NULL AND created > NOW() - INTERVAL '6 hours' AND (device_id IS NULL OR device_id = $6)`,
       // note — «маршрут менялся», «завершён не у Б»: такие поездки в среднюю ошибку не идут.
       [parseInt(b.id, 10) || 0, num(b.real_price, 1, 20000), num(b.real_km, 0, 1000), num(b.real_min, 0, 1000),
-        cleanText(b.note, 40) || null]
+        cleanText(b.note, 40) || null, deviceId]
     );
     res.json({ ok: true });
   }));
+
+  // «Мои поездки» и /admin/trips.
+  require('./trips')(app, pool, { member, escapeHtml });
+
+  // Раз в сутки сами ищем ненайденные адреса в OpenStreetMap (отели, кафе, ТЦ).
+  setTimeout(() => geocoder.autoResolveMisses().catch(() => {}), 2 * 60e3).unref();
+  setInterval(() => geocoder.autoResolveMisses().catch(() => {}), 24 * 3600e3).unref();
 
   // Открыто: счётчики без ключей и без адресов.
   app.get('/api/geocode-status', async (req, res) => {
@@ -754,13 +763,6 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       const fmt = d => new Date(d).toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau' });
       const btn = 'border:none;padding:4px 8px;border-radius:4px;color:#fff;cursor:pointer;';
       const addr = await geocoder.adminData();
-      const trips = (await pool.query('SELECT * FROM trip_reports ORDER BY id DESC LIMIT 50')).rows;
-      const acc = (await pool.query(
-        `SELECT COUNT(*) AS n,
-           AVG(real_price - est_price) AS avg_diff, AVG(ABS(real_price - est_price)) AS avg_abs,
-           AVG(ABS(real_price - nav_price)) FILTER (WHERE nav_price IS NOT NULL) AS nav_abs
-         FROM trip_reports WHERE real_price IS NOT NULL AND note IS NULL AND created > NOW() - INTERVAL '30 days'`
-      )).rows[0];
       const lei = v => v == null ? '—' : `${Math.round(Number(v))} L`;
 
       const missRows = addr.misses.map(m => `
@@ -792,15 +794,6 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
         </tr>`).join('');
       const countLine = addr.counts.map(c => `${c.source === 'admin' ? 'от админа' : 'с поездок'}: ${c.total}` +
         (c.source === 'gps' ? ` (подтверждено 2+ поездками: ${c.confirmed})` : '')).join(' · ');
-      const tripRows = trips.map(t => `
-        <tr>
-          <td style="white-space:nowrap;">${escapeHtml(fmt(t.created))}</td>
-          <td>${escapeHtml(t.tariff)}${t.stops ? ` +${escapeHtml(t.stops)} заезд` : ''}${t.surge ? ` +${escapeHtml(t.surge)}` : ''}</td>
-          <td>${lei(t.est_price)} · ${Number(t.est_km).toFixed(1)} км · ${Math.round(t.est_min)} мин</td>
-          <td>${t.nav_price == null ? '—' : `${lei(t.nav_price)} · ${Number(t.nav_km).toFixed(1)} км · ${Math.round(t.nav_min)} мин`}</td>
-          <td>${t.real_price == null ? (t.finished ? 'цена не распознана' : '—') : `<b>${lei(t.real_price)}</b>`}${t.real_km != null ? ` · ${Number(t.real_km).toFixed(1)} км` : ''}${t.real_min != null ? ` · ${Math.round(t.real_min)} мин` : ''}</td>
-          <td>${t.real_price == null ? '' : `${t.real_price - t.est_price > 0 ? '+' : ''}${t.real_price - t.est_price} L`}${t.note ? `<br><span style="font-size:12px;color:#dd6b20;">${escapeHtml(t.note)} — не в среднем</span>` : ''}</td>
-        </tr>`).join('');
 
       const chatRows = messages.map(m => `
         <tr style="${m.deleted ? 'opacity:.4' : ''}">
@@ -879,7 +872,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           table { width: 100%; border-collapse: collapse; } td, th { padding: 8px; border-bottom: 1px solid #edf2f7; font-size: 14px; text-align: left; vertical-align: top; }
           th { background: #2b6cb0; color: #fff; } input[type=text] { padding: 6px; width: 260px; }
         </style></head><body>
-        <div class="card"><a href="/admin/view-devices">← Устройства и ключи</a>${notice}</div>
+        ${require('./admin_nav').adminNav('/admin/community')}
+        ${notice ? `<div class="card">${notice}</div>` : ''}
         <div class="card"><h2>📍 Адреса, которые не нашлись (${addr.misses.length})</h2>
           <p style="font-size:13px;color:#4a5568;">Эти адреса не нашлись — цена по ним не показывалась. Впишите рядом настоящий адрес («Mitropolit Varlaam 7») или координаты с карты и нажмите «Сохранить» — дальше адрес будет находиться у всех. «Найти сам» — поискать этот текст у Яндекса и в OpenStreetMap (там есть отели, кафе, ТЦ). Бессмысленный текст (не адрес) — «Скрыть».</p>
           <table><tr><th>Адрес с карточки</th><th>Раз</th><th>Последний</th><th></th></tr>${missRows || '<tr><td colspan="4">Все адреса находятся 👍</td></tr>'}</table>
@@ -891,10 +885,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
           </form>
           <table><tr><th>Адрес</th><th>Точка</th><th>Откуда</th><th></th></tr>${pointRows || '<tr><td colspan="4">Пока нет</td></tr>'}</table>
         </div>
-        <div class="card"><h2>🎯 Точность цены</h2>
-          <p>За 30 дней поездок с ценой от Яндекса: <b>${escapeHtml(acc.n)}</b>. Средняя ошибка расчёта с карточки: <b>${lei(acc.avg_abs)}</b> (в среднем Яндекс ${acc.avg_diff != null && acc.avg_diff < 0 ? 'дешевле' : 'дороже'} на ${lei(acc.avg_diff == null ? null : Math.abs(acc.avg_diff))}). После «Поехали» по навигатору: <b>${lei(acc.nav_abs)}</b>.</p>
-          <table><tr><th>Когда</th><th>Тариф</th><th>Наш расчёт</th><th>По навигатору</th><th>Яндекс в конце</th><th>Разница</th></tr>${tripRows || '<tr><td colspan="6">Поездок пока нет</td></tr>'}</table>
-        </div>
+        <div class="card"><h2>🚕 Поездки и точность цены</h2><p>Перенесены на вкладку <a href="/admin/trips">«Поездки»</a>.</p></div>
         <div class="card"><h2>✈️ Аэропорт</h2><p>Сейчас в очереди водителей радара: <b>${escapeHtml(queue)}</b></p></div>
         <div class="card"><h2>👤 Клиенты</h2>
           <p>Номера в базе не хранятся — только зашифрованные отпечатки. Проверить или очистить номер можно, только введя его.</p>

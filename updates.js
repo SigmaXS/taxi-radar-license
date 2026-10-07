@@ -3,6 +3,7 @@
 // Пока ни одного APK не загружено — всё как раньше (LATEST_VERSION_* и пост в Telegram).
 const crypto = require('crypto');
 const express = require('express');
+const { adminNav } = require('./admin_nav');
 
 let latest = null; // { version_code, version_name, notes, sha256, size, created } — без самого файла
 
@@ -42,7 +43,7 @@ function setup(app, pool) {
 input,textarea,button{width:100%;box-sizing:border-box;margin:6px 0 14px;padding:12px;border-radius:12px;border:1px solid #2A3E57;background:#121F32;color:#E8EEF5;font-size:16px}
 button{background:#FFCC00;color:#141414;font-weight:700;border:0}td{padding:6px 8px;border-bottom:1px solid #2A3E57;vertical-align:top}
 a{color:#FFCC00}.muted{color:#98A8BA;font-size:14px}</style></head><body>
-<p><a href="/admin/view-devices">← Устройства</a></p>
+${adminNav('/admin/apk')}
 <h2>Выпустить обновление</h2>
 <p class="muted">После загрузки у всех водителей с более старой версией появится жёлтая плашка «Обновить» — файл скачается и установится прямо из приложения. Подпись APK приложение проверяет само: чужой файл не установится.</p>
 <form id="f">

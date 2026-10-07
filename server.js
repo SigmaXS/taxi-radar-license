@@ -602,11 +602,10 @@ app.get('/admin/view-devices', async (req, res) => {
         </style>
       </head>
       <body>
+        ${require('./admin_nav').adminNav('/admin/view-devices')}
         <div class="card">
-          <p><a href="/admin/apk" style="display:inline-block;padding:12px 18px;border-radius:12px;background:#FFCC00;color:#141414;font-weight:700;text-decoration:none">⬆️ Выпустить обновление приложения</a></p>
           <h2>📊 Аналитика и Статистика (PostgreSQL)</h2>
           ${req.query.msg ? `<p style="font-weight:bold;background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
-          <p><a href="/admin/community">💬 Чат, клиенты, метки на карте, аэропорт →</a> &nbsp;·&nbsp; <a href="/admin/messages">📣 Сообщение водителям</a> &nbsp;·&nbsp; <a href="/admin/crashes">🐞 Ошибки приложения</a></p>
           <div class="stats-grid">
             <div class="stat-box"><div>Всего устройств</div><div class="stat-num">${totalDevices}</div></div>
             <div class="stat-box"><div>⚡ Онлайн сейчас</div><div class="stat-num" style="color:#38a169;">${onlineDevices}</div></div>

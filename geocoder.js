@@ -193,6 +193,31 @@ module.exports = function createGeocoder(pool) {
     return run;
   }
 
+  /**
+   * Раз в сутки: ненайденные адреса (до 40 за раз, каждый не чаще раза в неделю) ищем
+   * в OpenStreetMap. Нашлось — точка «osm»: она работает, только пока Яндекс адрес не знает,
+   * и первая же поездка водителя её поправит. Админу остаются только мусорные строки.
+   */
+  async function autoResolveMisses() {
+    await pool.query('ALTER TABLE address_misses ADD COLUMN IF NOT EXISTS tried TIMESTAMP');
+    const rows = (await pool.query(
+      `SELECT q, text FROM address_misses WHERE (tried IS NULL OR tried < NOW() - INTERVAL '7 days')
+       AND last_seen > NOW() - INTERVAL '60 days' ORDER BY n DESC LIMIT 40`)).rows;
+    let found = 0;
+    for (const m of rows) {
+      await pool.query('UPDATE address_misses SET tried = NOW() WHERE q = $1', [m.q]);
+      const p = await osm(m.text);
+      if (!p) continue;
+      await pool.query(
+        `INSERT INTO address_points (q, lat, lon, n, source) VALUES ($1, $2, $3, 1, 'osm') ON CONFLICT (q) DO NOTHING`,
+        [m.q, p.lat, p.lon]);
+      await pool.query('DELETE FROM address_misses WHERE q = $1', [m.q]);
+      found++;
+    }
+    if (rows.length) console.log(`Автопоиск адресов: проверено ${rows.length}, найдено ${found}`);
+    return found;
+  }
+
   /** Для админки: найти точку по любому тексту — адрес у Яндекса, название места в OpenStreetMap. */
   async function findAny(text) {
     const t = String(text || '').trim();
@@ -377,5 +402,5 @@ module.exports = function createGeocoder(pool) {
     };
   }
 
-  return { lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize, findAny };
+  return { lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize, findAny, autoResolveMisses };
 };

@@ -4,6 +4,7 @@
 //  • /admin/messages — сообщение всем водителям: баннер на главной приложения (с 1.17).
 //    Можно показать только тем, у кого версия старее — «обновитесь».
 const crypto = require('crypto');
+const { adminNav } = require('./admin_nav');
 
 module.exports = function setupNotices(app, pool, { isValidDeviceId, escapeHtml }) {
   pool.query(`
@@ -36,7 +37,7 @@ module.exports = function setupNotices(app, pool, { isValidDeviceId, escapeHtml 
       'SELECT id, text, below_version FROM announcements WHERE active AND (until IS NULL OR until > NOW()) ORDER BY id DESC LIMIT 1');
     current = r.rows[0] || null;
   }
-  setInterval(() => refresh().catch(() => {}), 10 * 60 * 1000);
+  setInterval(() => refresh().catch(() => {}), 10 * 60 * 1000).unref();
 
   // Не больше 20 отчётов в час с одного адреса — падение в цикле не завалит базу.
   const hits = new Map();
@@ -73,13 +74,13 @@ module.exports = function setupNotices(app, pool, { isValidDeviceId, escapeHtml 
     }
   });
 
-  const page = (title, body) => `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  const page = (title, body, active) => `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title><style>
 body{font-family:sans-serif;background:#f0f2f5;padding:20px;margin:0}.card{background:#fff;border-radius:10px;padding:18px;max-width:1150px;margin:0 auto 18px;box-shadow:0 4px 12px rgba(0,0,0,.06)}
 table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #edf2f7;font-size:14px;text-align:left;vertical-align:top}th{background:#2b6cb0;color:#fff}
 pre{white-space:pre-wrap;font-size:12px;background:#f7fafc;padding:8px;border-radius:6px;max-height:300px;overflow:auto}
 textarea,input,select{padding:8px;font-size:15px;border:1px solid #cbd5e0;border-radius:6px}button{border:0;padding:8px 14px;border-radius:6px;color:#fff;cursor:pointer;font-weight:bold}
-</style></head><body><div class="card"><a href="/admin/view-devices">← Устройства</a> · <a href="/admin/community">Сообщество</a></div>${body}</body></html>`;
+</style></head><body>${adminNav(active)}${body}</body></html>`;
   const fmt = d => new Date(d).toLocaleString('ru-RU', { timeZone: 'Europe/Chisinau' });
 
   app.get('/admin/crashes', async (req, res) => {
@@ -94,7 +95,7 @@ textarea,input,select{padding:8px;font-size:15px;border:1px solid #cbd5e0;border
     res.send(page('Ошибки приложения', `<div class="card"><h2>🐞 Ошибки приложения (${rows.length})</h2>
       <p style="font-size:13px;color:#4a5568">Приложение упало — при следующем запуске оно присылает, где именно (с 1.17). Одинаковые ошибки склеены.
       Нажмите на текст ошибки, чтобы увидеть подробности; «Исправлено» — убрать из списка (если повторится, появится снова).</p>
-      <table><tr><th>Последний раз</th><th>Сколько</th><th>Версия и телефон</th><th>Ошибка</th><th></th></tr>${list || '<tr><td colspan="5">Ошибок нет 👍</td></tr>'}</table></div>`));
+      <table><tr><th>Последний раз</th><th>Сколько</th><th>Версия и телефон</th><th>Ошибка</th><th></th></tr>${list || '<tr><td colspan="5">Ошибок нет 👍</td></tr>'}</table></div>`, '/admin/crashes'));
   });
 
   app.post('/admin/crashes', async (req, res) => {
@@ -121,7 +122,7 @@ textarea,input,select{padding:8px;font-size:15px;border:1px solid #cbd5e0;border
           ${latest ? `<option value="${latest.code}">только у кого версия старее ${escapeHtml(latest.name)}</option>` : ''}</select>
         &nbsp; Показывать: <select name="days"><option value="1">1 день</option><option value="3">3 дня</option><option value="7" selected>7 дней</option><option value="">пока не сниму</option></select></p>
         <button style="background:#2b6cb0">Отправить водителям</button></form></div>
-      <div class="card"><h3>Отправленные</h3><table><tr><th>Когда</th><th>Текст</th><th>Кому</th><th>До</th><th></th></tr>${list || '<tr><td colspan="5">Пока нет</td></tr>'}</table></div>`));
+      <div class="card"><h3>Отправленные</h3><table><tr><th>Когда</th><th>Текст</th><th>Кому</th><th>До</th><th></th></tr>${list || '<tr><td colspan="5">Пока нет</td></tr>'}</table></div>`, '/admin/messages'));
   });
 
   app.post('/admin/messages', async (req, res) => {
