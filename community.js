@@ -700,14 +700,22 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     const b = req.body;
     const estPrice = num(b.est_price, 1, 20000);
     if (estPrice == null) return res.json({ ok: false });
+    // client_id — номер поездки от телефона: телефон может прислать начало повторно
+    // (очередь при плохой связи) — второй раз не записываем. at — когда это было на самом деле.
+    const clientId = /^[\w-]{8,40}$/.test(String(b.client_id || '')) ? String(b.client_id) : null;
+    const at = num(b.at, Date.now() - 3 * 86400e3, Date.now() + 60e3);
+    if (clientId) {
+      const old = (await pool.query('SELECT id FROM trip_reports WHERE device_id = $1 AND client_id = $2', [deviceId, clientId])).rows[0];
+      if (old) return res.json({ ok: true, id: String(old.id) });
+    }
     const r = await pool.query(
-      `INSERT INTO trip_reports (tariff, stops, surge, est_price, est_km, est_min, nav_km, nav_min, nav_price, device_id, route_from, route_to)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+      `INSERT INTO trip_reports (tariff, stops, surge, est_price, est_km, est_min, nav_km, nav_min, nav_price, device_id, route_from, route_to, client_id, created)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE(to_timestamp($14 / 1000.0) AT TIME ZONE 'UTC', NOW())) RETURNING id`,
       [cleanText(b.tariff, 20) || '?', num(b.stops, 0, 10) || 0, num(b.surge, 0, 5000) || 0, estPrice,
         num(b.est_km, 0, 1000) || 0, num(b.est_min, 0, 1000) || 0,
         num(b.nav_km, 0, 1000), num(b.nav_min, 0, 1000), num(b.nav_price, 1, 20000),
         // Для «Моих поездок» водителя (адреса хранятся 60 дней, см. trips.js).
-        deviceId, cleanText(b.from, 120) || null, cleanText(b.to, 120) || null]
+        deviceId, cleanText(b.from, 120) || null, cleanText(b.to, 120) || null, clientId, at]
     );
     res.json({ ok: true, id: String(r.rows[0].id) });
   }));
@@ -715,6 +723,17 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   // Поездка закончилась: цена, км и минуты, которые показал Яндекс Про.
   app.post('/api/trips/finish', member(async (req, res, deviceId) => {
     const b = req.body;
+    const clientId = /^[\w-]{8,40}$/.test(String(b.client_id || '')) ? String(b.client_id) : null;
+    if (clientId) {
+      // Из очереди телефона: могло прийти и через сутки — ищем поездку по её номеру.
+      const at = num(b.at, Date.now() - 3 * 86400e3, Date.now() + 60e3);
+      await pool.query(
+        `UPDATE trip_reports SET real_price = $3, real_min = $4, note = $5,
+           finished = COALESCE(to_timestamp($6 / 1000.0) AT TIME ZONE 'UTC', NOW())
+         WHERE device_id = $1 AND client_id = $2 AND finished IS NULL`,
+        [deviceId, clientId, num(b.real_price, 1, 20000), num(b.real_min, 0, 1000), cleanText(b.note, 40) || null, at]);
+      return res.json({ ok: true });
+    }
     await pool.query(
       `UPDATE trip_reports SET real_price = $2, real_km = $3, real_min = $4, note = $5, finished = NOW()
        WHERE id = $1 AND finished IS NULL AND created > NOW() - INTERVAL '6 hours' AND (device_id IS NULL OR device_id = $6)`,

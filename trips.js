@@ -88,7 +88,10 @@ module.exports = function setupTrips(app, pool, { member, escapeHtml }) {
     ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS route_from VARCHAR(120);
     ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS route_to VARCHAR(120);
     CREATE INDEX IF NOT EXISTS trip_reports_device ON trip_reports (device_id, id DESC);
+    ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS client_id VARCHAR(40);
+    CREATE UNIQUE INDEX IF NOT EXISTS trip_reports_client ON trip_reports (device_id, client_id) WHERE client_id IS NOT NULL;
     ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS disputed TIMESTAMP;
+    ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS dispute_status VARCHAR(20);
     ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS dispute_reason VARCHAR(40);
     ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS dispute_comment VARCHAR(300);
     ALTER TABLE trip_reports ADD COLUMN IF NOT EXISTS dispute_done BOOLEAN NOT NULL DEFAULT false;
@@ -104,7 +107,8 @@ module.exports = function setupTrips(app, pool, { member, escapeHtml }) {
   app.post('/api/trips/mine', member(async (req, res, deviceId) => {
     const rows = (await pool.query(
       `SELECT id, created, tariff, stops, surge, est_price, est_km, est_min, nav_km, nav_min, nav_price,
-              real_price, real_km, real_min, note, finished, route_from, route_to, disputed
+              real_price, real_km, real_min, note, finished, route_from, route_to, disputed, client_id,
+              dispute_done, dispute_status
        FROM trip_reports WHERE device_id = $1 ORDER BY id DESC LIMIT 50`, [deviceId])).rows;
     res.json({
       ok: true,
@@ -115,7 +119,10 @@ module.exports = function setupTrips(app, pool, { member, escapeHtml }) {
         nav_price: t.nav_price, real_price: t.real_price,
         real_min: t.real_min == null ? null : Math.round(Number(t.real_min)),
         reasons: explain(t),
-        disputed: !!t.disputed
+        disputed: !!t.disputed,
+        // Номер поездки на телефоне — по нему «Мои поездки» склеивают сервер и журнал смены.
+        key: t.client_id || '',
+        dispute_status: t.disputed ? (t.dispute_status || (t.dispute_done ? 'checked' : 'received')) : ''
       }))
     });
   }));
