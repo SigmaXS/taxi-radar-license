@@ -195,7 +195,7 @@ app.get('/api/app-config', (req, res) => {
 // Если Яндекс поменяет тарифы — SURGE_BASE в Railway, например «30,45,65,25»,
 // без нового приложения.
 function surgeBase() {
-  const [econom, comfort, comfortplus, express] = String(process.env.SURGE_BASE || '30,45,65,25')
+  const [econom, comfort, comfortplus, express] = String(process.env.SURGE_BASE || '30,45,65,24')
     .split(',').map(v => parseInt(v, 10));
   const ok = v => Number.isFinite(v) && v > 0;
   return {
@@ -203,7 +203,7 @@ function surgeBase() {
     comfort: ok(comfort) ? comfort : 45,
     comfortplus: ok(comfortplus) ? comfortplus : 65,
     // «Доставка» у Яндекса — класс «express».
-    express: ok(express) ? express : 25
+    express: ok(express) ? express : 24
   };
 }
 
