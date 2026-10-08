@@ -65,12 +65,15 @@ function parseEvent(html, url, category = '') {
 }
 
 module.exports = function setupEventsImport(pool) {
-  pool.query(`
+  // Колонки добавляем перед каждым импортом: таблицу events создаёт events.js, и при старте
+  // сервера она может появиться позже, чем этот модуль.
+  const ensure = () => pool.query(`
     ALTER TABLE events ADD COLUMN IF NOT EXISTS source VARCHAR(20);
     ALTER TABLE events ADD COLUMN IF NOT EXISTS source_url VARCHAR(300);
     ALTER TABLE events ADD COLUMN IF NOT EXISTS admin_edited BOOLEAN NOT NULL DEFAULT false;
     CREATE UNIQUE INDEX IF NOT EXISTS events_source_url ON events (source_url) WHERE source_url IS NOT NULL;
-  `).catch(e => console.error('events import init:', e.message));
+  `);
+  setTimeout(() => ensure().catch(() => {}), 20e3).unref();
 
   let running = false;
   async function run() {
@@ -78,6 +81,7 @@ module.exports = function setupEventsImport(pool) {
     running = true;
     let added = 0, updated = 0, seen = 0;
     try {
+      await ensure();
       const urls = new Map(); // адрес -> раздел (concert/festival/standup)
       for (const cat of CATEGORIES) {
         const html = await get(`${SITE}/events/${cat}`).catch(() => '');
