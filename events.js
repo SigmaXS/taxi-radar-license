@@ -22,7 +22,7 @@ const local = d => {
 
 module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder }) {
   // Автоимпорт с iticket.md (крупные площадки) — раз в 6 часов.
-  const importer = require('./events_import')(pool);
+  const importer = require('./events_import')(pool, geocoder);
   pool.query(`
     CREATE TABLE IF NOT EXISTS events (
       id SERIAL PRIMARY KEY,
@@ -73,7 +73,7 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
       `SELECT * FROM events WHERE status <> 'deleted' AND ends > NOW() - INTERVAL '3 days' ORDER BY starts LIMIT 100`)).rows;
     const list = rows.map(e => `<tr style="${e.status === 'cancelled' ? 'opacity:.5' : ''}">
       <td style="white-space:nowrap;">${escapeHtml(fmt(e.starts))}<br>до ~${escapeHtml(fmt(e.ends).slice(-5))}</td>
-      <td><b>${escapeHtml(e.title)}</b>${e.status === 'cancelled' ? ' <span style="color:#e53e3e;">ОТМЕНЕНО</span>' : ''}${e.source === 'iticket' ? ` <a href="${escapeHtml(e.source_url)}" target="_blank" style="font-size:12px;background:#ebf8ff;padding:2px 6px;border-radius:6px;">iticket</a>` : ''}<br>${escapeHtml(e.place)}
+      <td><b>${escapeHtml(e.title)}</b>${e.status === 'cancelled' ? ' <span style="color:#e53e3e;">ОТМЕНЕНО</span>' : ''}${e.source ? ` <a href="${escapeHtml(e.source_url)}" target="_blank" style="font-size:12px;background:#ebf8ff;padding:2px 6px;border-radius:6px;">${escapeHtml(e.source)}</a>` : ''}<br>${escapeHtml(e.place)}
         ${e.lat != null ? ` · <a href="https://yandex.ru/maps/?pt=${e.lon},${e.lat}&z=16" target="_blank">карта</a>` : ' · <span style="color:#dd6b20;">точка не найдена</span>'}
         ${e.people ? `<br>👥 ~${e.people}` : ''}${e.note ? `<br><span style="font-size:13px;color:#4a5568;">${escapeHtml(e.note)}</span>` : ''}</td>
       <td style="white-space:nowrap;"><form method="POST" action="/admin/events" style="margin:0;display:grid;gap:4px;">
@@ -105,8 +105,8 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
           <p><button name="action" value="add" style="border:0;padding:12px 18px;border-radius:8px;background:#2b6cb0;color:#fff;font-weight:bold;cursor:pointer;">Добавить событие</button></p>
         </form></div>
       <div class="card"><h2>Ближайшие события</h2>
-        <p style="font-size:13px;color:#4a5568;">События с пометкой «iticket» добавляются сами раз в 6 часов: концерты, фестивали и стендап на крупных площадках (Арена, Дворец Республики, Национальный дворец, стендап в Опере). Опера, балет, спектакли и детское — не берём. Окончание у них примерное (начало + 2,5 ч) — поправьте «Перенести», если знаете точнее.</p>
-        <form method="POST" action="/admin/events" style="margin:0 0 10px;"><button name="action" value="import" style="border:0;padding:8px 14px;border-radius:6px;background:#3182ce;color:#fff;cursor:pointer;">Обновить с iticket сейчас</button></form>
+        <p style="font-size:13px;color:#4a5568;">События с пометкой «iticket» или «afisha» добавляются сами раз в 6 часов: концерты, фестивали, шоу и стендап на крупных площадках (Арена, Дворец Республики, Национальный дворец, стендап в Опере). Одно и то же событие с двух сайтов не дублируется. Опера, балет, спектакли и детское — не берём. Окончание у них примерное (начало + 2,5 ч) — поправьте «Перенести», если знаете точнее.</p>
+        <form method="POST" action="/admin/events" style="margin:0 0 10px;"><button name="action" value="import" style="border:0;padding:8px 14px;border-radius:6px;background:#3182ce;color:#fff;cursor:pointer;">Обновить с iticket и afisha сейчас</button></form>
         <table><tr><th>Когда</th><th>Что и где</th><th></th></tr>${list || '<tr><td colspan="3">Пока нет</td></tr>'}</table></div>
     </body></html>`);
   });
@@ -119,7 +119,7 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
       const ev = id ? (await pool.query('SELECT * FROM events WHERE id = $1', [id])).rows[0] : null;
       if (b.action === 'import') {
         const r = await importer.run();
-        msg = r ? `iticket: подходящих ${r.seen}, новых ${r.added}, перенесено ${r.updated}` : 'Импорт уже идёт — обновите страницу через минуту';
+        msg = r ? `iticket + afisha: подходящих ${r.seen}, новых ${r.added}, повторов пропущено ${r.dup}, перенесено ${r.updated}` : 'Импорт уже идёт — обновите страницу через минуту';
       } else if (b.action === 'add') {
         const starts = chisinauToUtc(b.starts), ends = chisinauToUtc(b.ends);
         const title = String(b.title || '').trim().slice(0, 120), place = String(b.place || '').trim().slice(0, 160);
