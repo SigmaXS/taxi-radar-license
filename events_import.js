@@ -4,7 +4,7 @@
 // правки импорт больше не трогает (admin_edited).
 const SITE = 'https://iticket.md/ru';
 const CATEGORIES = ['concert', 'festival', 'standup'];
-// Крупные площадки и примерная вместимость (для подписи «~N человек»).
+// Крупные площадки (число — примерная вместимость, только для справки; водителям не показываем).
 const VENUES = [
   [/арена|arena chi/i, 10000],
   [/дворец республики|palatul republicii/i, 2800],
@@ -82,6 +82,8 @@ module.exports = function setupEventsImport(pool) {
     let added = 0, updated = 0, seen = 0;
     try {
       await ensure();
+      // Сколько людей придёт, iticket не пишет; вместимость зала вводила в заблуждение — не показываем.
+      await pool.query(`UPDATE events SET people = NULL WHERE source = 'iticket' AND people IS NOT NULL`);
       const urls = new Map(); // адрес -> раздел (concert/festival/standup)
       for (const cat of CATEGORIES) {
         const html = await get(`${SITE}/events/${cat}`).catch(() => '');
@@ -100,8 +102,8 @@ module.exports = function setupEventsImport(pool) {
         if (!old) {
           await pool.query(
             `INSERT INTO events (title, place, lat, lon, starts, ends, people, note, source, source_url)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'iticket', $9) ON CONFLICT DO NOTHING`,
-            [e.title, e.place, e.lat, e.lon, e.starts, e.ends, e.people, 'По данным iticket.md; окончание примерное', url]);
+             VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, 'iticket', $8) ON CONFLICT DO NOTHING`,
+            [e.title, e.place, e.lat, e.lon, e.starts, e.ends, 'По данным iticket.md; окончание примерное', url]);
           added++;
         } else if (!old.admin_edited && (new Date(old.starts).getTime() !== e.starts.getTime())) {
           // Перенесли на сайте — переносим и у нас (напоминания водителей переставятся сами).
