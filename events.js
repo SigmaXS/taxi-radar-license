@@ -21,6 +21,8 @@ const local = d => {
 };
 
 module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder }) {
+  // Автоимпорт с iticket.md (крупные площадки) — раз в 6 часов.
+  const importer = require('./events_import')(pool);
   pool.query(`
     CREATE TABLE IF NOT EXISTS events (
       id SERIAL PRIMARY KEY,
@@ -71,7 +73,7 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
       `SELECT * FROM events WHERE status <> 'deleted' AND ends > NOW() - INTERVAL '3 days' ORDER BY starts LIMIT 100`)).rows;
     const list = rows.map(e => `<tr style="${e.status === 'cancelled' ? 'opacity:.5' : ''}">
       <td style="white-space:nowrap;">${escapeHtml(fmt(e.starts))}<br>до ~${escapeHtml(fmt(e.ends).slice(-5))}</td>
-      <td><b>${escapeHtml(e.title)}</b>${e.status === 'cancelled' ? ' <span style="color:#e53e3e;">ОТМЕНЕНО</span>' : ''}<br>${escapeHtml(e.place)}
+      <td><b>${escapeHtml(e.title)}</b>${e.status === 'cancelled' ? ' <span style="color:#e53e3e;">ОТМЕНЕНО</span>' : ''}${e.source === 'iticket' ? ` <a href="${escapeHtml(e.source_url)}" target="_blank" style="font-size:12px;background:#ebf8ff;padding:2px 6px;border-radius:6px;">iticket</a>` : ''}<br>${escapeHtml(e.place)}
         ${e.lat != null ? ` · <a href="https://yandex.ru/maps/?pt=${e.lon},${e.lat}&z=16" target="_blank">карта</a>` : ' · <span style="color:#dd6b20;">точка не найдена</span>'}
         ${e.people ? `<br>👥 ~${e.people}` : ''}${e.note ? `<br><span style="font-size:13px;color:#4a5568;">${escapeHtml(e.note)}</span>` : ''}</td>
       <td style="white-space:nowrap;"><form method="POST" action="/admin/events" style="margin:0;display:grid;gap:4px;">
@@ -103,6 +105,8 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
           <p><button name="action" value="add" style="border:0;padding:12px 18px;border-radius:8px;background:#2b6cb0;color:#fff;font-weight:bold;cursor:pointer;">Добавить событие</button></p>
         </form></div>
       <div class="card"><h2>Ближайшие события</h2>
+        <p style="font-size:13px;color:#4a5568;">События с пометкой «iticket» добавляются сами раз в 6 часов: концерты, фестивали и стендап на крупных площадках (Арена, Дворец Республики, Национальный дворец, стендап в Опере). Опера, балет, спектакли и детское — не берём. Окончание у них примерное (начало + 2,5 ч) — поправьте «Перенести», если знаете точнее.</p>
+        <form method="POST" action="/admin/events" style="margin:0 0 10px;"><button name="action" value="import" style="border:0;padding:8px 14px;border-radius:6px;background:#3182ce;color:#fff;cursor:pointer;">Обновить с iticket сейчас</button></form>
         <table><tr><th>Когда</th><th>Что и где</th><th></th></tr>${list || '<tr><td colspan="3">Пока нет</td></tr>'}</table></div>
     </body></html>`);
   });
@@ -113,7 +117,10 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
     try {
       const id = parseInt(b.id, 10) || 0;
       const ev = id ? (await pool.query('SELECT * FROM events WHERE id = $1', [id])).rows[0] : null;
-      if (b.action === 'add') {
+      if (b.action === 'import') {
+        const r = await importer.run();
+        msg = r ? `iticket: подходящих ${r.seen}, новых ${r.added}, перенесено ${r.updated}` : 'Импорт уже идёт — обновите страницу через минуту';
+      } else if (b.action === 'add') {
         const starts = chisinauToUtc(b.starts), ends = chisinauToUtc(b.ends);
         const title = String(b.title || '').trim().slice(0, 120), place = String(b.place || '').trim().slice(0, 160);
         if (!title || !place || !starts || !ends || ends <= starts) msg = 'Проверьте название, место и время (окончание позже начала)';
@@ -135,16 +142,16 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
         const starts = chisinauToUtc(b.starts), ends = chisinauToUtc(b.ends);
         if (!starts || !ends || ends <= starts) msg = 'Проверьте время';
         else {
-          await pool.query('UPDATE events SET starts = $2, ends = $3, updated = NOW() WHERE id = $1', [id, starts, ends]);
+          await pool.query('UPDATE events SET starts = $2, ends = $3, updated = NOW(), admin_edited = true WHERE id = $1', [id, starts, ends]);
           if (ev.posted) await post(`🔁 Перенос: ${ev.title}\n🕒 теперь ${fmt(starts)} — ~${fmt(ends).slice(-5)}\n📍 ${ev.place}`);
           msg = 'Время изменено — у водителей напоминание переставится само';
         }
       } else if (ev && (b.action === 'cancel' || b.action === 'restore')) {
-        await pool.query('UPDATE events SET status = $2, updated = NOW() WHERE id = $1', [id, b.action === 'cancel' ? 'cancelled' : 'ok']);
+        await pool.query('UPDATE events SET status = $2, updated = NOW(), admin_edited = true WHERE id = $1', [id, b.action === 'cancel' ? 'cancelled' : 'ok']);
         if (ev.posted && b.action === 'cancel') await post(`❌ Отменено: ${ev.title} (${fmt(ev.starts)})`);
         msg = b.action === 'cancel' ? 'Событие отменено — водителям с напоминанием придёт уведомление' : 'Событие возвращено';
       } else if (ev && b.action === 'delete') {
-        await pool.query(`UPDATE events SET status = 'deleted', updated = NOW() WHERE id = $1`, [id]);
+        await pool.query(`UPDATE events SET status = 'deleted', updated = NOW(), admin_edited = true WHERE id = $1`, [id]);
         msg = 'Удалено';
       }
     } catch (e) {
