@@ -83,7 +83,7 @@ module.exports = function setupWeekly(app, pool, { escapeHtml, latestVersion }) 
 
   app.get('/admin/weekly', async (req, res) => {
     const text = await build();
-    res.send(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Сводка — Taxi Radar</title>
+    res.send(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Сводка — Taxi Radar</title>
       <style>body{font-family:sans-serif;background:#f0f2f5;padding:25px;margin:0}.card{background:#fff;border-radius:10px;padding:20px;max-width:1150px;margin:0 auto 20px;box-shadow:0 4px 12px rgba(0,0,0,.06)}
       pre{white-space:pre-wrap;font-size:16px;line-height:1.5;font-family:inherit}button{border:0;padding:12px 18px;border-radius:8px;background:#2b6cb0;color:#fff;font-weight:bold;cursor:pointer;font-size:15px}</style></head><body>
       ${adminNav('/admin/weekly')}

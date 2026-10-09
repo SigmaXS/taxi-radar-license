@@ -74,7 +74,7 @@ module.exports = function setupNotices(app, pool, { isValidDeviceId, escapeHtml 
     }
   });
 
-  const page = (title, body, active) => `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  const page = (title, body, active) => `<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <title>${title}</title><style>
 body{font-family:sans-serif;background:#f0f2f5;padding:20px;margin:0}.card{background:#fff;border-radius:10px;padding:18px;max-width:1150px;margin:0 auto 18px;box-shadow:0 4px 12px rgba(0,0,0,.06)}
 table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #edf2f7;font-size:14px;text-align:left;vertical-align:top}th{background:#2b6cb0;color:#fff}

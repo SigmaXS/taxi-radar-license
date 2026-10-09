@@ -85,7 +85,7 @@ module.exports = function setupEvents(app, pool, { member, escapeHtml, geocoder 
           : '<button name="action" value="cancel" style="border:0;padding:7px;border-radius:6px;background:#dd6b20;color:#fff;cursor:pointer;">Отменить</button>'}
         <button name="action" value="delete" onclick="return confirm('Удалить событие совсем?')" style="border:0;padding:7px;border-radius:6px;background:#e53e3e;color:#fff;cursor:pointer;">Удалить</button>
       </form></td></tr>`).join('');
-    res.send(`<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>События — Taxi Radar</title>
+    res.send(`<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>События — Taxi Radar</title>
       <style>body{font-family:sans-serif;background:#f0f2f5;padding:25px;margin:0}.card{background:#fff;border-radius:10px;padding:20px;max-width:1150px;margin:0 auto 20px;box-shadow:0 4px 12px rgba(0,0,0,.06)}
       table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #edf2f7;font-size:14px;text-align:left;vertical-align:top}th{background:#2b6cb0;color:#fff}
       input,textarea{padding:8px;font-size:15px;border:1px solid #cbd5e0;border-radius:6px;box-sizing:border-box}label{display:block;margin-top:10px;font-weight:bold;font-size:14px}</style></head><body>

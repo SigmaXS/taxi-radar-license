@@ -217,7 +217,7 @@ module.exports = function setupTrips(app, pool, { member, escapeHtml }) {
           <td style="font-size:13px;">${explain(t).map(r => escapeHtml(r.ru)).join('<br>')}</td>
         </tr>`).join('');
 
-      res.send(`<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Поездки — Taxi Radar</title>
+      res.send(`<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>Поездки — Taxi Radar</title>
         <style>body{font-family:sans-serif;background:#f0f2f5;padding:25px;margin:0}.card{background:#fff;border-radius:10px;padding:20px;max-width:1150px;margin:0 auto 20px;box-shadow:0 4px 12px rgba(0,0,0,.06)}
         table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #edf2f7;font-size:14px;text-align:left;vertical-align:top}th{background:#2b6cb0;color:#fff}</style></head><body>
         ${adminNav('/admin/trips')}

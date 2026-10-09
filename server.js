@@ -370,7 +370,10 @@ app.post('/api/activate-device', async (req, res) => {
     }
     const keyData = keyQuery.rows[0];
 
-    const expireDate = new Date(Date.now() + Math.round(keyData.duration_hours * 3600 * 1000));
+    // Ключ прибавляется к оставшемуся сроку (и к пробным дням), а не начинает подписку заново.
+    const cur = devCheck.rows[0];
+    const from = cur && cur.status !== 'disabled' && new Date(cur.expires) > new Date() ? new Date(cur.expires) : new Date();
+    const expireDate = new Date(from.getTime() + Math.round(keyData.duration_hours * 3600 * 1000));
 
     await pool.query(`
       INSERT INTO devices (device_id, key_code, expires, last_seen, status, type, device_info)
@@ -502,7 +505,22 @@ app.get('/admin/view-devices', async (req, res) => {
     const versionCounts = new Map();
     let outdated = 0;
 
-    const devicesList = devicesQuery.rows.map(dev => {
+    // Поиск по ID, ключу или телефону; платные (осталось больше 7 дней) — сверху.
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const daysLeftOf = d => (new Date(d.expires).getTime() - now) / 86400e3;
+    const isPaid = d => d.status !== 'banned' && d.status !== 'disabled' && daysLeftOf(d) > 7;
+    const shown = devicesQuery.rows
+      .filter(d => !q || [d.device_id, d.key_code, d.device_info, d.type].some(v => String(v || '').toLowerCase().includes(q)))
+      .sort((a, b) => (isPaid(b) - isPaid(a)) || (new Date(b.last_seen || 0) - new Date(a.last_seen || 0)));
+    const paidCount = shown.filter(isPaid).length;
+    let groupShown = '';
+    const devicesList = shown.map(dev => {
+      const paid = isPaid(dev);
+      const group = paid ? 'paid' : 'rest';
+      const groupRow = group !== groupShown
+        ? `<tr><td colspan="5" style="background:${paid ? '#fefcbf' : '#edf2f7'};font-weight:bold;">${paid ? `💎 Подписка больше 7 дней — ${paidCount}` : `Остальные (7 дней и меньше, пробные, истёкшие) — ${shown.length - paidCount}`}</td></tr>`
+        : '';
+      groupShown = group;
       totalDevices++;
       const isBanned = dev.status === 'banned';
       const isDisabled = dev.status === 'disabled';
@@ -550,8 +568,8 @@ app.get('/admin/view-devices', async (req, res) => {
         hour: '2-digit', minute: '2-digit', second: '2-digit'
       });
 
-      return `
-        <tr>
+      return groupRow + `
+        <tr style="${paid ? 'background:#fffff0;' : ''}">
           <td style="white-space:nowrap;">${statusHtml}</td>
           <td><div style="font-weight:bold;">${escapeHtml(dev.key_code)}</div><div style="font-size:12px;color:#718096;">${escapeHtml(dev.type || '')}</div></td>
           <td>
@@ -559,12 +577,13 @@ app.get('/admin/view-devices', async (req, res) => {
             <code style="background:#feebc8;color:#c05621;padding:2px 6px;border-radius:4px;font-size:12px;">${escapeHtml(dev.device_id)}</code>
             ${refHtml}
           </td>
-          <td>${escapeHtml(formattedDate)}</td>
+          <td>${escapeHtml(formattedDate)}${paid ? `<br><span style="font-size:12px;font-weight:bold;color:#b7791f;">осталось ${Math.floor(daysLeftOf(dev))} дн.</span>` : ''}</td>
           <td style="white-space:nowrap;">
             <form method="POST" action="/admin/action" style="display:inline;">
               <input type="hidden" name="device_id" value="${escapeHtml(dev.device_id)}">
               <input type="number" name="days" min="1" max="3650" placeholder="дней" style="width:62px;padding:4px;">
               <button name="action" value="add_days" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">+ Добавить</button>
+              <button name="action" value="sub_days" onclick="return confirm('Убрать указанное число дней?')" style="background:#c05621;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">− Убрать</button>
               ${canDisable ? '<button name="action" value="disable" onclick="return confirm(\'Отключить подписку у этого устройства?\')" style="background:#718096;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Отключить</button>' : ''}
               ${isBanned ? '<button name="action" value="unban" style="background:#38a169;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;font-weight:bold;">Разбанить</button>' : '<button name="action" value="ban" style="background:#e53e3e;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">В БАН</button>'}
               <button name="action" value="unlink" style="background:#dd6b20;color:#fff;border:none;padding:5px 9px;border-radius:4px;cursor:pointer;">Удалить</button>
@@ -649,6 +668,12 @@ app.get('/admin/view-devices', async (req, res) => {
         </div>
         <div class="card">
           <h2>🔑 Устройства в базе</h2>
+          <form method="GET" action="/admin/view-devices" style="display:flex;gap:8px;margin:6px 0 4px;">
+            <input name="q" value="${escapeHtml(q)}" placeholder="Поиск: ID устройства, ключ или модель телефона" style="flex:1;padding:12px;font-size:16px;border:2px solid #bee3f8;border-radius:8px;">
+            <button style="background:#2b6cb0;color:#fff;border:none;padding:12px 18px;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer;">Найти</button>
+            ${q ? '<a href="/admin/view-devices" style="align-self:center;">сбросить</a>' : ''}
+          </form>
+          ${q ? `<p>Найдено: <b>${shown.length}</b></p>` : ''}
           <table>
             <thead>
               <tr><th>Статус</th><th>Ключ</th><th>Телефон / ID</th><th>Истекает</th><th>Действие</th></tr>
@@ -729,6 +754,17 @@ app.post('/admin/action', async (req, res) => {
          WHERE device_id = $2 RETURNING expires`,
         // В колонке «Тип» видно, что дни добавлены вручную, сколько и когда.
         [String(days), device_id, `Продлено +${days} дн. (${new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Chisinau', day: '2-digit', month: '2-digit' })})`]
+      );
+      if (!r.rows.length) return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Устройство не найдено'));
+    } else if (action === 'sub_days') {
+      // −N дней от текущего срока (ошиблись с продлением). Ушло в прошлое — подписка просто закончилась.
+      const days = parseInt(req.body.days, 10);
+      if (!(days >= 1 && days <= 3650)) {
+        return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Введите число дней от 1 до 3650'));
+      }
+      const r = await pool.query(
+        `UPDATE devices SET expires = expires - ($1 || ' days')::INTERVAL, type = $3 WHERE device_id = $2 RETURNING expires`,
+        [String(days), device_id, `Убрано −${days} дн. (${new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Chisinau', day: '2-digit', month: '2-digit' })})`]
       );
       if (!r.rows.length) return res.redirect('/admin/view-devices?msg=' + encodeURIComponent('Устройство не найдено'));
     }

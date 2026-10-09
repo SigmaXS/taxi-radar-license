@@ -37,14 +37,16 @@ function setup(app, pool) {
   // Страница загрузки (вход в /admin уже проверен requireAdmin).
   app.get('/admin/apk', async (req, res) => {
     const list = await pool.query('SELECT id, version_code, version_name, size, created, notes FROM app_builds ORDER BY id DESC LIMIT 10');
-    res.send(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    res.send(`<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <title>Обновление приложения</title>
-<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:24px auto;padding:0 16px;background:#090F1C;color:#E8EEF5}
-input,textarea,button{width:100%;box-sizing:border-box;margin:6px 0 14px;padding:12px;border-radius:12px;border:1px solid #2A3E57;background:#121F32;color:#E8EEF5;font-size:16px}
-button{background:#FFCC00;color:#141414;font-weight:700;border:0}td{padding:6px 8px;border-bottom:1px solid #2A3E57;vertical-align:top}
-a{color:#FFCC00}.muted{color:#98A8BA;font-size:14px}</style></head><body>
+<style>body{font-family:sans-serif;background:#f0f2f5;padding:25px;margin:0;color:#1a202c}
+.wrap{background:#fff;border-radius:10px;padding:20px;max-width:1150px;margin:0 auto 20px;box-shadow:0 4px 12px rgba(0,0,0,.06)}
+input,textarea{width:100%;box-sizing:border-box;margin:6px 0 14px;padding:10px;border-radius:6px;border:1px solid #cbd5e0;font-size:15px}
+button{background:#2b6cb0;color:#fff;font-weight:bold;border:0;padding:12px 18px;border-radius:8px;font-size:15px;cursor:pointer}
+table{width:100%;border-collapse:collapse}td{padding:8px;border-bottom:1px solid #edf2f7;font-size:14px;vertical-align:top}
+a{color:#2b6cb0}.muted{color:#4a5568;font-size:14px}</style></head><body>
 ${adminNav('/admin/apk')}
-<h2>Выпустить обновление</h2>
+<div class="wrap"><h2>Выпустить обновление</h2>
 <p class="muted">После загрузки у всех водителей с более старой версией появится жёлтая плашка «Обновить» — файл скачается и установится прямо из приложения. Подпись APK приложение проверяет само: чужой файл не установится.</p>
 <form id="f">
 <label>APK-файл</label><input type="file" id="file" accept=".apk" required>
@@ -61,7 +63,7 @@ document.getElementById('f').onsubmit = async e => {
   const r = await fetch('/admin/apk?' + q, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: document.getElementById('file').files[0] });
   st.textContent = await r.text(); if (r.ok) setTimeout(() => location.reload(), 1500);
 };
-</script></body></html>`);
+</script></div></body></html>`);
   });
 
   app.post('/admin/apk', express.raw({ type: 'application/octet-stream', limit: '40mb' }), async (req, res) => {
