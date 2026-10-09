@@ -52,6 +52,10 @@ async function initDB() {
       ALTER TABLE referrals ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT false;
       -- Сколько дней реально начислили за этого друга (могли уйти на погашение долга).
       ALTER TABLE referrals ADD COLUMN IF NOT EXISTS bonus_days NUMERIC;
+      -- Бонус за покупку ключа другом выдан. Раньше бонус был только за покупку — переносим отметку.
+      ALTER TABLE referrals ADD COLUMN IF NOT EXISTS purchase_rewarded BOOLEAN;
+      UPDATE referrals SET purchase_rewarded = (rewarded AND NOT free_bonus) WHERE purchase_rewarded IS NULL;
+      ALTER TABLE referrals ALTER COLUMN purchase_rewarded SET DEFAULT false;
       -- Долг за отменённые бонусы, которые не из чего было снять: гасится следующими бонусами за друзей.
       ALTER TABLE devices ADD COLUMN IF NOT EXISTS ref_debt_days NUMERIC NOT NULL DEFAULT 0;
       -- В какие дни устройство выходило на связь (для проверки «друг пользуется»).
@@ -172,6 +176,13 @@ ${code ? `<p>Код друга — введите его при первом з�
 </div></body></html>`);
 });
 
+// Бонус пригласившему сразу за введённый код (на проверке).
+function referralInstallDays() {
+  const days = parseInt(process.env.REFERRAL_INSTALL_DAYS || '2', 10);
+  return Number.isFinite(days) && days >= 0 ? days : 2;
+}
+
+// Бонус пригласившему, когда друг купил ключ (сверх бонуса за код).
 function referralBonusDays() {
   const days = parseInt(process.env.REFERRAL_BONUS_DAYS || '3', 10);
   return Number.isFinite(days) && days > 0 ? days : 3;
@@ -264,32 +275,40 @@ async function deviceExists(deviceId) {
   return r.rows.length > 0;
 }
 
-// Бонус пригласившему — один раз на друга, сразу как друг ввёл код. Он на проверке:
-// если за REFERRAL_CHECK_DAYS друг не пользовался радаром — дни снимаются (защита от накрутки).
-// Купил ключ — бонус остаётся навсегда. [onPurchase] — вызов из активации ключа.
+// Бонусы пригласившему, по разу на друга:
+//  • REFERRAL_INSTALL_DAYS (2) — сразу, как друг ввёл код. На проверке: если за REFERRAL_CHECK_DAYS
+//    друг не пользовался радаром — дни снимаются (защита от накрутки);
+//  • REFERRAL_BONUS_DAYS (3) — ещё сверху, когда друг купит ключ (и бонус за код становится окончательным).
+// [onPurchase] — вызов из активации ключа.
 async function rewardReferrer(deviceId, onPurchase = true) {
+  let claimed;
   if (onPurchase) {
-    // Бонус уже дан за установку — теперь он окончательный.
-    await pool.query('UPDATE referrals SET kept = true WHERE device_id = $1 AND rewarded AND free_bonus AND NOT revoked', [deviceId]);
+    claimed = await pool.query(
+      `UPDATE referrals SET purchase_rewarded = true, kept = true, rewarded = true, rewarded_at = COALESCE(rewarded_at, NOW())
+        WHERE device_id = $1 AND referred_by IS NOT NULL AND NOT purchase_rewarded AND NOT revoked RETURNING referred_by`,
+      [deviceId]);
+  } else {
+    claimed = await pool.query(
+      `UPDATE referrals SET rewarded = true, rewarded_at = NOW(), free_bonus = true
+        WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by`,
+      [deviceId]);
   }
-  const claimed = await pool.query(
-    'UPDATE referrals SET rewarded = true, rewarded_at = NOW(), free_bonus = $2, kept = $3 WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by',
-    [deviceId, !onPurchase, onPurchase]
-  );
-  if (claimed.rows.length === 0) return;
+  if (claimed.rows.length === 0) return false;
+  const days = onPurchase ? referralBonusDays() : referralInstallDays();
   const referrer = await pool.query(
     'SELECT d.device_id, d.expires, d.status, d.ref_debt_days FROM referrals r JOIN devices d ON d.device_id = r.device_id WHERE r.code = $1',
     [claimed.rows[0].referred_by]
   );
-  if (referrer.rows.length === 0 || referrer.rows[0].status === 'banned') return;
+  if (referrer.rows.length === 0 || referrer.rows[0].status === 'banned') return false;
   // Сначала гасим долг за прошлых «друзей», которые так и не стали пользоваться.
   const debt = Math.max(0, Number(referrer.rows[0].ref_debt_days) || 0);
-  const give = Math.max(0, referralBonusDays() - debt);
+  const give = Math.max(0, days - debt);
   const base = Math.max(new Date(referrer.rows[0].expires).getTime(), Date.now());
   const newExp = new Date(base + give * 24 * 3600 * 1000);
   await pool.query('UPDATE devices SET expires = $1, ref_debt_days = $2 WHERE device_id = $3',
-    [give > 0 ? newExp : referrer.rows[0].expires, Math.max(0, debt - referralBonusDays()), referrer.rows[0].device_id]);
-  await pool.query('UPDATE referrals SET bonus_days = $2 WHERE device_id = $1', [deviceId, give]);
+    [give > 0 ? newExp : referrer.rows[0].expires, Math.max(0, debt - days), referrer.rows[0].device_id]);
+  // Сколько начислили именно за код — столько и снимем, если друг не станет пользоваться.
+  if (!onPurchase) await pool.query('UPDATE referrals SET bonus_days = $2 WHERE device_id = $1', [deviceId, give]);
   return true;
 }
 
@@ -321,7 +340,7 @@ async function checkReferralBonuses() {
     const ref = (await pool.query(
       `SELECT d.device_id, d.expires FROM referrals x JOIN devices d ON d.device_id = x.device_id WHERE x.code = $1`, [r.referred_by])).rows[0];
     const granted = (await pool.query('SELECT bonus_days FROM referrals WHERE device_id = $1', [r.device_id])).rows[0];
-    const take = granted && granted.bonus_days != null ? Number(granted.bonus_days) : referralBonusDays();
+    const take = granted && granted.bonus_days != null ? Number(granted.bonus_days) : referralInstallDays();
     if (ref && take > 0) {
       const leftDays = Math.max(0, (new Date(ref.expires).getTime() - Date.now()) / 86400e3);
       const fromSub = Math.min(take, leftDays);
@@ -357,7 +376,8 @@ app.post('/api/referral/me', async (req, res) => {
       pending: parseInt(stats.rows[0].pending, 10),
       revoked: parseInt(stats.rows[0].revoked, 10),
       check_days: referralCheckDays(),
-      bonus_days: referralBonusDays()
+      bonus_days: referralBonusDays(),
+      install_days: referralInstallDays()
     });
   } catch (err) {
     console.error(err);
@@ -390,7 +410,7 @@ app.post('/api/referral/apply', async (req, res) => {
     // Другу (пригласившему) — +N дней сразу, покупать ключ не обязательно.
     const now = await rewardReferrer(device_id, false).catch(e => { console.error('Referral reward error:', e); return false; });
     return res.json({ ok: true, rewarded: now, message: now
-      ? `Код принят! Другу начислено +${referralBonusDays()} дн.`
+      ? `Код принят! Другу начислено +${referralInstallDays()} дн., а когда купите ключ — ещё +${referralBonusDays()} дн.`
       : `Код принят! Когда купите ключ, другу начислится +${referralBonusDays()} дн.` });
   } catch (err) {
     console.error(err);
