@@ -50,6 +50,10 @@ async function initDB() {
       ALTER TABLE referrals ADD COLUMN IF NOT EXISTS free_bonus BOOLEAN NOT NULL DEFAULT false;
       ALTER TABLE referrals ADD COLUMN IF NOT EXISTS kept BOOLEAN NOT NULL DEFAULT false;
       ALTER TABLE referrals ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT false;
+      -- Сколько дней реально начислили за этого друга (могли уйти на погашение долга).
+      ALTER TABLE referrals ADD COLUMN IF NOT EXISTS bonus_days NUMERIC;
+      -- Долг за отменённые бонусы, которые не из чего было снять: гасится следующими бонусами за друзей.
+      ALTER TABLE devices ADD COLUMN IF NOT EXISTS ref_debt_days NUMERIC NOT NULL DEFAULT 0;
       -- В какие дни устройство выходило на связь (для проверки «друг пользуется»).
       CREATE TABLE IF NOT EXISTS device_days (
         device_id VARCHAR(100) NOT NULL,
@@ -274,13 +278,18 @@ async function rewardReferrer(deviceId, onPurchase = true) {
   );
   if (claimed.rows.length === 0) return;
   const referrer = await pool.query(
-    'SELECT d.device_id, d.expires, d.status FROM referrals r JOIN devices d ON d.device_id = r.device_id WHERE r.code = $1',
+    'SELECT d.device_id, d.expires, d.status, d.ref_debt_days FROM referrals r JOIN devices d ON d.device_id = r.device_id WHERE r.code = $1',
     [claimed.rows[0].referred_by]
   );
   if (referrer.rows.length === 0 || referrer.rows[0].status === 'banned') return;
+  // Сначала гасим долг за прошлых «друзей», которые так и не стали пользоваться.
+  const debt = Math.max(0, Number(referrer.rows[0].ref_debt_days) || 0);
+  const give = Math.max(0, referralBonusDays() - debt);
   const base = Math.max(new Date(referrer.rows[0].expires).getTime(), Date.now());
-  const newExp = new Date(base + referralBonusDays() * 24 * 3600 * 1000);
-  await pool.query('UPDATE devices SET expires = $1 WHERE device_id = $2', [newExp, referrer.rows[0].device_id]);
+  const newExp = new Date(base + give * 24 * 3600 * 1000);
+  await pool.query('UPDATE devices SET expires = $1, ref_debt_days = $2 WHERE device_id = $3',
+    [give > 0 ? newExp : referrer.rows[0].expires, Math.max(0, debt - referralBonusDays()), referrer.rows[0].device_id]);
+  await pool.query('UPDATE referrals SET bonus_days = $2 WHERE device_id = $1', [deviceId, give]);
   return true;
 }
 
@@ -308,10 +317,18 @@ async function checkReferralBonuses() {
     }
     const upd = await pool.query('UPDATE referrals SET revoked = true WHERE device_id = $1 AND NOT revoked RETURNING 1', [r.device_id]);
     if (!upd.rows.length) continue;
-    await pool.query(
-      `UPDATE devices SET expires = expires - ($1 || ' days')::INTERVAL
-        WHERE device_id = (SELECT device_id FROM referrals WHERE code = $2)`,
-      [String(referralBonusDays()), r.referred_by]);
+    // Снимаем столько, сколько реально начислили; чего нет в остатке подписки — в долг.
+    const ref = (await pool.query(
+      `SELECT d.device_id, d.expires FROM referrals x JOIN devices d ON d.device_id = x.device_id WHERE x.code = $1`, [r.referred_by])).rows[0];
+    const granted = (await pool.query('SELECT bonus_days FROM referrals WHERE device_id = $1', [r.device_id])).rows[0];
+    const take = granted && granted.bonus_days != null ? Number(granted.bonus_days) : referralBonusDays();
+    if (ref && take > 0) {
+      const leftDays = Math.max(0, (new Date(ref.expires).getTime() - Date.now()) / 86400e3);
+      const fromSub = Math.min(take, leftDays);
+      await pool.query(
+        `UPDATE devices SET expires = expires - ($1 || ' days')::INTERVAL, ref_debt_days = ref_debt_days + $2 WHERE device_id = $3`,
+        [String(fromSub), take - fromSub, ref.device_id]);
+    }
     console.log(`Реферальный бонус снят: друг ${r.device_id} не пользовался (дней ${days}, поездок ${trips})`);
   }
 }
