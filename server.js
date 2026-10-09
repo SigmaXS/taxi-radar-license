@@ -45,6 +45,17 @@ async function initDB() {
         created TIMESTAMP
       );
       ALTER TABLE referrals ADD COLUMN IF NOT EXISTS rewarded_at TIMESTAMP;
+      -- Бонус «за установку» на проверке: free_bonus — дан без покупки; kept — друг пользуется, бонус навсегда;
+      -- revoked — друг не пользовался, дни сняты.
+      ALTER TABLE referrals ADD COLUMN IF NOT EXISTS free_bonus BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE referrals ADD COLUMN IF NOT EXISTS kept BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE referrals ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT false;
+      -- В какие дни устройство выходило на связь (для проверки «друг пользуется»).
+      CREATE TABLE IF NOT EXISTS device_days (
+        device_id VARCHAR(100) NOT NULL,
+        day DATE NOT NULL,
+        PRIMARY KEY (device_id, day)
+      );
     `);
     console.log("Database initialized successfully.");
   } catch (err) {
@@ -249,27 +260,17 @@ async function deviceExists(deviceId) {
   return r.rows.length > 0;
 }
 
-// Сколько бонусов «просто за установку» (без покупки) один водитель может получить за 30 дней.
-// Сверх лимита бонус придёт, когда друг купит ключ. Защита от накрутки выдуманными устройствами.
-function referralFreePerMonth() {
-  const n = parseInt(process.env.REFERRAL_FREE_PER_MONTH || '10', 10);
-  return Number.isFinite(n) && n >= 0 ? n : 10;
-}
-
-// Бонус пригласившему — один раз на друга: сразу, как друг ввёл код (в пределах лимита),
-// иначе — когда друг купит ключ. [onPurchase] — вызов из активации ключа.
+// Бонус пригласившему — один раз на друга, сразу как друг ввёл код. Он на проверке:
+// если за REFERRAL_CHECK_DAYS друг не пользовался радаром — дни снимаются (защита от накрутки).
+// Купил ключ — бонус остаётся навсегда. [onPurchase] — вызов из активации ключа.
 async function rewardReferrer(deviceId, onPurchase = true) {
-  if (!onPurchase) {
-    const own = (await pool.query('SELECT referred_by FROM referrals WHERE device_id = $1', [deviceId])).rows[0];
-    if (!own || !own.referred_by) return false;
-    const recent = await pool.query(
-      `SELECT COUNT(*) AS n FROM referrals WHERE referred_by = $1 AND rewarded AND rewarded_at > NOW() - INTERVAL '30 days'`,
-      [own.referred_by]);
-    if (parseInt(recent.rows[0].n, 10) >= referralFreePerMonth()) return false;
+  if (onPurchase) {
+    // Бонус уже дан за установку — теперь он окончательный.
+    await pool.query('UPDATE referrals SET kept = true WHERE device_id = $1 AND rewarded AND free_bonus AND NOT revoked', [deviceId]);
   }
   const claimed = await pool.query(
-    'UPDATE referrals SET rewarded = true, rewarded_at = NOW() WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by',
-    [deviceId]
+    'UPDATE referrals SET rewarded = true, rewarded_at = NOW(), free_bonus = $2, kept = $3 WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by',
+    [deviceId, !onPurchase, onPurchase]
   );
   if (claimed.rows.length === 0) return;
   const referrer = await pool.query(
@@ -283,6 +284,40 @@ async function rewardReferrer(deviceId, onPurchase = true) {
   return true;
 }
 
+function referralCheckDays() {
+  const n = parseInt(process.env.REFERRAL_CHECK_DAYS || '7', 10);
+  return Number.isFinite(n) && n > 0 ? n : 7;
+}
+
+// Раз в час: бонусы «за установку», у которых кончилась проверка. Друг пользуется
+// (выходил на связь минимум 2 разных дня И радар увидел хотя бы одну его поездку) — бонус остаётся,
+// иначе — снимаем эти дни у пригласившего.
+async function checkReferralBonuses() {
+  const due = (await pool.query(
+    `SELECT device_id, referred_by FROM referrals
+      WHERE rewarded AND free_bonus AND NOT kept AND NOT revoked
+        AND rewarded_at < NOW() - ($1 || ' days')::INTERVAL`, [String(referralCheckDays())])).rows;
+  for (const r of due) {
+    const days = parseInt((await pool.query(
+      `SELECT COUNT(*) AS n FROM device_days WHERE device_id = $1`, [r.device_id])).rows[0].n, 10);
+    const trips = parseInt((await pool.query(
+      `SELECT COUNT(*) AS n FROM trip_reports WHERE device_id = $1`, [r.device_id]).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n, 10);
+    if (days >= 2 && trips >= 1) {
+      await pool.query('UPDATE referrals SET kept = true WHERE device_id = $1', [r.device_id]);
+      continue;
+    }
+    const upd = await pool.query('UPDATE referrals SET revoked = true WHERE device_id = $1 AND NOT revoked RETURNING 1', [r.device_id]);
+    if (!upd.rows.length) continue;
+    await pool.query(
+      `UPDATE devices SET expires = expires - ($1 || ' days')::INTERVAL
+        WHERE device_id = (SELECT device_id FROM referrals WHERE code = $2)`,
+      [String(referralBonusDays()), r.referred_by]);
+    console.log(`Реферальный бонус снят: друг ${r.device_id} не пользовался (дней ${days}, поездок ${trips})`);
+  }
+}
+setInterval(() => checkReferralBonuses().catch(e => console.error('referral check:', e.message)), 3600e3).unref();
+setTimeout(() => checkReferralBonuses().catch(() => {}), 120e3).unref();
+
 app.post('/api/referral/me', async (req, res) => {
   const { device_id } = req.body;
   if (!isValidDeviceId(device_id)) return res.status(400).json({ ok: false, message: "Нет ID" });
@@ -290,7 +325,10 @@ app.post('/api/referral/me', async (req, res) => {
     if (!(await deviceExists(device_id))) return res.json({ ok: false, message: "Сначала активируйте доступ" });
     const ref = await ensureReferralCode(device_id);
     const stats = await pool.query(
-      'SELECT COUNT(*) AS invited, COUNT(*) FILTER (WHERE rewarded) AS rewarded FROM referrals WHERE referred_by = $1',
+      `SELECT COUNT(*) AS invited, COUNT(*) FILTER (WHERE rewarded AND NOT revoked) AS rewarded,
+              COUNT(*) FILTER (WHERE rewarded AND free_bonus AND NOT kept AND NOT revoked) AS pending,
+              COUNT(*) FILTER (WHERE revoked) AS revoked
+         FROM referrals WHERE referred_by = $1`,
       [ref.code]
     );
     return res.json({
@@ -299,6 +337,9 @@ app.post('/api/referral/me', async (req, res) => {
       referred_by: ref.referred_by,
       invited: parseInt(stats.rows[0].invited, 10),
       rewarded: parseInt(stats.rows[0].rewarded, 10),
+      pending: parseInt(stats.rows[0].pending, 10),
+      revoked: parseInt(stats.rows[0].revoked, 10),
+      check_days: referralCheckDays(),
       bonus_days: referralBonusDays()
     });
   } catch (err) {
@@ -462,6 +503,8 @@ app.post('/api/check-license', async (req, res) => {
       'UPDATE devices SET last_seen = $1, device_info = COALESCE($2, device_info) WHERE device_id = $3',
       [serverNow, cleanDeviceInfo(req.body.device_info), device_id]
     );
+    pool.query(`INSERT INTO device_days (device_id, day) VALUES ($1, (NOW() AT TIME ZONE 'Europe/Chisinau')::date) ON CONFLICT DO NOTHING`,
+      [device_id]).catch(() => {});
 
     if (dev.status === 'banned') {
       return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано" });
