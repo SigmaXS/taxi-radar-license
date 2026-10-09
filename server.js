@@ -44,6 +44,7 @@ async function initDB() {
         rewarded BOOLEAN NOT NULL DEFAULT false,
         created TIMESTAMP
       );
+      ALTER TABLE referrals ADD COLUMN IF NOT EXISTS rewarded_at TIMESTAMP;
     `);
     console.log("Database initialized successfully.");
   } catch (err) {
@@ -135,6 +136,26 @@ const notices = require('./notices')(app, pool, { isValidDeviceId, escapeHtml })
 require('./weekly')(app, pool, { escapeHtml, latestVersion: updates.latestVersion });
 
 app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
+
+// Ссылка-приглашение: кнопка скачать APK и код друга, который ввести при первом запуске.
+app.get('/invite/:code?', (req, res) => {
+  const code = String(req.params.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+  res.send(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Taxi Radar — приглашение</title>
+<style>body{font-family:sans-serif;background:#0f1720;color:#fff;margin:0;padding:24px;text-align:center}
+.c{max-width:460px;margin:0 auto}h1{font-size:26px;margin:18px 0 8px}p{color:#cbd5e0;line-height:1.5;font-size:16px}
+a.b{display:block;background:#ffcc00;color:#111;font-weight:bold;font-size:20px;padding:18px;border-radius:14px;text-decoration:none;margin:22px 0}
+.code{font-size:34px;font-weight:bold;letter-spacing:4px;color:#ffcc00;background:#1a2733;border:2px dashed #ffcc00;border-radius:12px;padding:14px;margin:10px 0}
+ol{text-align:left;color:#cbd5e0;line-height:1.7;font-size:15px}</style></head><body><div class="c">
+<h1>🚕 Taxi Radar</h1>
+<p>Цена заказа, надбавка и карта — прямо поверх Яндекс Про. 7 дней бесплатно.</p>
+<a class="b" href="/download/taxiradar.apk">⬇️ Скачать приложение</a>
+${code ? `<p>Код друга — введите его при первом запуске:</p><div class="code">${code}</div>` : ''}
+<ol><li>Скачайте и откройте файл (разрешите установку из браузера, если телефон спросит).</li>
+<li>При первом запуске нажмите «У меня есть код друга»${code ? ' и введите код выше' : ''}.</li>
+<li>Включите радар — и откройте Яндекс Про.</li></ol>
+</div></body></html>`);
+});
 
 function referralBonusDays() {
   const days = parseInt(process.env.REFERRAL_BONUS_DAYS || '3', 10);
@@ -228,11 +249,26 @@ async function deviceExists(deviceId) {
   return r.rows.length > 0;
 }
 
-// Бонус пригласившему — только когда приглашённый купил ключ (не триал),
-// иначе рефералку можно накрутить фейковыми устройствами. Один раз на друга.
-async function rewardReferrer(deviceId) {
+// Сколько бонусов «просто за установку» (без покупки) один водитель может получить за 30 дней.
+// Сверх лимита бонус придёт, когда друг купит ключ. Защита от накрутки выдуманными устройствами.
+function referralFreePerMonth() {
+  const n = parseInt(process.env.REFERRAL_FREE_PER_MONTH || '10', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 10;
+}
+
+// Бонус пригласившему — один раз на друга: сразу, как друг ввёл код (в пределах лимита),
+// иначе — когда друг купит ключ. [onPurchase] — вызов из активации ключа.
+async function rewardReferrer(deviceId, onPurchase = true) {
+  if (!onPurchase) {
+    const own = (await pool.query('SELECT referred_by FROM referrals WHERE device_id = $1', [deviceId])).rows[0];
+    if (!own || !own.referred_by) return false;
+    const recent = await pool.query(
+      `SELECT COUNT(*) AS n FROM referrals WHERE referred_by = $1 AND rewarded AND rewarded_at > NOW() - INTERVAL '30 days'`,
+      [own.referred_by]);
+    if (parseInt(recent.rows[0].n, 10) >= referralFreePerMonth()) return false;
+  }
   const claimed = await pool.query(
-    'UPDATE referrals SET rewarded = true WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by',
+    'UPDATE referrals SET rewarded = true, rewarded_at = NOW() WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by',
     [deviceId]
   );
   if (claimed.rows.length === 0) return;
@@ -244,6 +280,7 @@ async function rewardReferrer(deviceId) {
   const base = Math.max(new Date(referrer.rows[0].expires).getTime(), Date.now());
   const newExp = new Date(base + referralBonusDays() * 24 * 3600 * 1000);
   await pool.query('UPDATE devices SET expires = $1 WHERE device_id = $2', [newExp, referrer.rows[0].device_id]);
+  return true;
 }
 
 app.post('/api/referral/me', async (req, res) => {
@@ -292,7 +329,11 @@ app.post('/api/referral/apply', async (req, res) => {
       [cleanCode, device_id]
     );
     if (updated.rows.length === 0) return res.json({ ok: false, message: "Код друга уже введён" });
-    return res.json({ ok: true, message: `Код принят! Когда купите ключ, другу начислится +${referralBonusDays()} дн.` });
+    // Другу (пригласившему) — +N дней сразу, покупать ключ не обязательно.
+    const now = await rewardReferrer(device_id, false).catch(e => { console.error('Referral reward error:', e); return false; });
+    return res.json({ ok: true, rewarded: now, message: now
+      ? `Код принят! Другу начислено +${referralBonusDays()} дн.`
+      : `Код принят! Когда купите ключ, другу начислится +${referralBonusDays()} дн.` });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, message: "Ошибка базы данных" });
