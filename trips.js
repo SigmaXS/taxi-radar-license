@@ -13,6 +13,16 @@ function explain(t) {
   const out = [];
   const add = (ru, ro) => out.push({ ru, ro });
   const est = t.est_price, real = t.real_price;
+  if (t.note === 'конец не увиден') {
+    add('Радар не увидел экран «Заказ завершён» (начался следующий заказ или телефон выгрузил радар). Поездка записана в смену черновиком — подтвердите цену.',
+      'Radarul nu a văzut ecranul «Comandă finalizată» (a început comanda următoare sau telefonul a oprit radarul). Cursa e salvată ca ciornă — confirmați prețul.');
+    return out;
+  }
+  if (real == null && !t.finished && t.created && Date.now() - new Date(t.created).getTime() > 3 * 3600e3) {
+    add('Радар не увидел конец поездки (экран «Заказ завершён» не попался или телефон выгрузил радар). В версии 2.1 такие поездки закрываются сами.',
+      'Radarul nu a văzut sfârșitul cursei. În versiunea 2.1 astfel de curse se închid singure.');
+    return out;
+  }
   if (real == null) {
     add(t.finished ? 'Итоговую цену не удалось прочитать с экрана Яндекса.' : 'Поездка ещё не завершена или радар не увидел её конец.',
       t.finished ? 'Prețul final nu a putut fi citit de pe ecranul Yandex.' : 'Cursa nu s-a încheiat sau radarul nu a văzut sfârșitul.');
