@@ -281,35 +281,41 @@ async function deviceExists(deviceId) {
 //  • REFERRAL_BONUS_DAYS (3) — ещё сверху, когда друг купит ключ (и бонус за код становится окончательным).
 // [onPurchase] — вызов из активации ключа.
 async function rewardReferrer(deviceId, onPurchase = true) {
-  let claimed;
-  if (onPurchase) {
-    claimed = await pool.query(
-      `UPDATE referrals SET purchase_rewarded = true, kept = true, rewarded = true, rewarded_at = COALESCE(rewarded_at, NOW())
-        WHERE device_id = $1 AND referred_by IS NOT NULL AND NOT purchase_rewarded AND NOT revoked RETURNING referred_by`,
-      [deviceId]);
-  } else {
-    claimed = await pool.query(
-      `UPDATE referrals SET rewarded = true, rewarded_at = NOW(), free_bonus = true
-        WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by`,
-      [deviceId]);
+  // Всё в одной транзакции: отметка «начислено» и продление вместе; срок пригласившего
+  // блокируем (FOR UPDATE) — два друга одновременно не затрут бонусы друг друга.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const claimed = onPurchase
+      ? await client.query(
+        `UPDATE referrals SET purchase_rewarded = true, kept = true, rewarded = true, rewarded_at = COALESCE(rewarded_at, NOW())
+          WHERE device_id = $1 AND referred_by IS NOT NULL AND NOT purchase_rewarded AND NOT revoked RETURNING referred_by`, [deviceId])
+      : await client.query(
+        `UPDATE referrals SET rewarded = true, rewarded_at = NOW(), free_bonus = true
+          WHERE device_id = $1 AND referred_by IS NOT NULL AND rewarded = false RETURNING referred_by`, [deviceId]);
+    if (!claimed.rows.length) { await client.query('ROLLBACK'); return false; }
+    const days = onPurchase ? referralBonusDays() : referralInstallDays();
+    const ref = (await client.query(
+      `SELECT d.device_id, d.status, d.ref_debt_days FROM referrals r JOIN devices d ON d.device_id = r.device_id
+        WHERE r.code = $1 FOR UPDATE OF d`, [claimed.rows[0].referred_by])).rows[0];
+    if (!ref || ref.status === 'banned') { await client.query('ROLLBACK'); return false; }
+    // Сначала гасим долг за прошлых «друзей», которые так и не стали пользоваться.
+    const debt = Math.max(0, Number(ref.ref_debt_days) || 0);
+    const give = Math.max(0, days - debt);
+    await client.query(
+      `UPDATE devices SET ref_debt_days = $2,
+         expires = CASE WHEN $3 > 0 THEN GREATEST(expires, NOW()) + ($3 || ' days')::INTERVAL ELSE expires END
+       WHERE device_id = $1`, [ref.device_id, Math.max(0, debt - days), give]);
+    // Сколько начислили именно за код — столько и снимем, если друг не станет пользоваться.
+    if (!onPurchase) await client.query('UPDATE referrals SET bonus_days = $2 WHERE device_id = $1', [deviceId, give]);
+    await client.query('COMMIT');
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
   }
-  if (claimed.rows.length === 0) return false;
-  const days = onPurchase ? referralBonusDays() : referralInstallDays();
-  const referrer = await pool.query(
-    'SELECT d.device_id, d.expires, d.status, d.ref_debt_days FROM referrals r JOIN devices d ON d.device_id = r.device_id WHERE r.code = $1',
-    [claimed.rows[0].referred_by]
-  );
-  if (referrer.rows.length === 0 || referrer.rows[0].status === 'banned') return false;
-  // Сначала гасим долг за прошлых «друзей», которые так и не стали пользоваться.
-  const debt = Math.max(0, Number(referrer.rows[0].ref_debt_days) || 0);
-  const give = Math.max(0, days - debt);
-  const base = Math.max(new Date(referrer.rows[0].expires).getTime(), Date.now());
-  const newExp = new Date(base + give * 24 * 3600 * 1000);
-  await pool.query('UPDATE devices SET expires = $1, ref_debt_days = $2 WHERE device_id = $3',
-    [give > 0 ? newExp : referrer.rows[0].expires, Math.max(0, debt - days), referrer.rows[0].device_id]);
-  // Сколько начислили именно за код — столько и снимем, если друг не станет пользоваться.
-  if (!onPurchase) await pool.query('UPDATE referrals SET bonus_days = $2 WHERE device_id = $1', [deviceId, give]);
-  return true;
 }
 
 function referralCheckDays() {
@@ -334,19 +340,29 @@ async function checkReferralBonuses() {
       await pool.query('UPDATE referrals SET kept = true WHERE device_id = $1', [r.device_id]);
       continue;
     }
-    const upd = await pool.query('UPDATE referrals SET revoked = true WHERE device_id = $1 AND NOT revoked RETURNING 1', [r.device_id]);
-    if (!upd.rows.length) continue;
-    // Снимаем столько, сколько реально начислили; чего нет в остатке подписки — в долг.
-    const ref = (await pool.query(
-      `SELECT d.device_id, d.expires FROM referrals x JOIN devices d ON d.device_id = x.device_id WHERE x.code = $1`, [r.referred_by])).rows[0];
-    const granted = (await pool.query('SELECT bonus_days FROM referrals WHERE device_id = $1', [r.device_id])).rows[0];
-    const take = granted && granted.bonus_days != null ? Number(granted.bonus_days) : referralInstallDays();
-    if (ref && take > 0) {
-      const leftDays = Math.max(0, (new Date(ref.expires).getTime() - Date.now()) / 86400e3);
-      const fromSub = Math.min(take, leftDays);
-      await pool.query(
-        `UPDATE devices SET expires = expires - ($1 || ' days')::INTERVAL, ref_debt_days = ref_debt_days + $2 WHERE device_id = $3`,
-        [String(fromSub), take - fromSub, ref.device_id]);
+    // Снимаем столько, сколько реально начислили; чего нет в остатке подписки — в долг. Одной транзакцией.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const upd = await client.query('UPDATE referrals SET revoked = true WHERE device_id = $1 AND NOT revoked RETURNING bonus_days', [r.device_id]);
+      if (!upd.rows.length) { await client.query('ROLLBACK'); continue; }
+      const take = upd.rows[0].bonus_days != null ? Number(upd.rows[0].bonus_days) : referralInstallDays();
+      const ref = (await client.query(
+        `SELECT d.device_id, d.expires FROM referrals x JOIN devices d ON d.device_id = x.device_id WHERE x.code = $1 FOR UPDATE OF d`,
+        [r.referred_by])).rows[0];
+      if (ref && take > 0) {
+        const leftDays = Math.max(0, (new Date(ref.expires).getTime() - Date.now()) / 86400e3);
+        const fromSub = Math.min(take, leftDays);
+        await client.query(
+          `UPDATE devices SET expires = expires - ($1 || ' days')::INTERVAL, ref_debt_days = ref_debt_days + $2 WHERE device_id = $3`,
+          [String(fromSub), take - fromSub, ref.device_id]);
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
     }
     console.log(`Реферальный бонус снят: друг ${r.device_id} не пользовался (дней ${days}, поездок ${trips})`);
   }

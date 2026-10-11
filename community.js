@@ -697,7 +697,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       const top = withPlace[0] || mine.sort((a, b) => a.age - b.age)[0];
       out[t] = {
         cars_from: top.place_from, cars_to: top.place_to, wait_min: top.wait_min,
-        age_min: Math.round(Math.min(...mine.map(r => Number(r.age)))), drivers: mine.length
+        // Возраст именно этой отметки, а не самой свежей у любого водителя.
+        age_min: Math.round(Number(top.age)), drivers: mine.length
       };
     }
     return out;
