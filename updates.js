@@ -20,6 +20,15 @@ async function init(pool) {
       created TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  // 2026-10-14: файл 2.2 (код 22) по ошибке загрузили как «2.3 (23)» — у водителей на 2.2 висело бы
+  // «есть обновление». Возвращаем записи настоящий номер; заодно чиним испорченный значок в тексте.
+  await pool.query(
+    `UPDATE app_builds SET version_code = 22, version_name = '2.2',
+       notes = regexp_replace(notes, '
+[^
+]*справлен неверный показ', E'
+🛠 Исправлен неверный показ')
+     WHERE sha256 = 'fa63b7e40621bb2d732bfd8add2eddcd7b70678c6b673de80db1f1cf8210abbf' AND version_code = 23`);
   await refresh(pool);
 }
 
