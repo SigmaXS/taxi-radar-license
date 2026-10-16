@@ -46,7 +46,7 @@ test('first configured provider in order answers; legs keep pickup and trip sepa
 });
 
 test('provider limit reply moves to the next one and is remembered', async () => {
-  const f = fixture({ env: { TOMTOM_API_KEY: 't', HERE_API_KEY: 'h' }, status: { tomtom: 429 } });
+  const f = fixture({ env: { ROUTE_PROVIDERS: 'tomtom,here', TOMTOM_API_KEY: 't', HERE_API_KEY: 'h' }, status: { tomtom: 429 } });
   assert.equal((await f.call()).result.provider, 'here');
   const before = f.calls.length;
   assert.equal((await f.call()).result.provider, 'here');
@@ -55,7 +55,7 @@ test('provider limit reply moves to the next one and is remembered', async () =>
 });
 
 test('own free limit stops using a provider before it bills', async () => {
-  const f = fixture({ env: { TOMTOM_API_KEY: 't', TOMTOM_DAILY_LIMIT: '2', MAPBOX_TOKEN: 'm' } });
+  const f = fixture({ env: { ROUTE_PROVIDERS: 'tomtom,mapbox', TOMTOM_API_KEY: 't', TOMTOM_DAILY_LIMIT: '2', MAPBOX_TOKEN: 'm' } });
   assert.equal((await f.call()).result.provider, 'tomtom');
   assert.equal((await f.call()).result.provider, 'mapbox');
 });
@@ -91,4 +91,10 @@ test('polylines: HERE flexible decodes, Google encoding matches known sample', (
   // Пример из документации Google: (38.5,-120.2), (40.7,-120.95), (43.252,-126.453)
   assert.equal(register.encodePolyline([[38.5, -120.2], [40.7, -120.95], [43.252, -126.453]]), '_p~iF~ps|U_ulLnnqC_mqNvxq`@');
   assert.throws(() => register.parseRoute({ routes: [] }));
+});
+
+test('by default only TomTom is used, even if other keys are present', async () => {
+  const f = fixture({ env: { HERE_API_KEY: 'h', MAPBOX_TOKEN: 'm' } });
+  assert.equal((await f.call()).result.code, 'route_not_configured');
+  assert.equal(f.calls.length, 0);
 });

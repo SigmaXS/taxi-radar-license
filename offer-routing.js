@@ -1,7 +1,7 @@
 // Маршрут для карточки заказа (подача и поездка) с живыми пробками — по очереди из нескольких
 // сервисов: первый, у кого не кончился бесплатный лимит, считает; кончился или ошибся — следующий.
 // Ключи только в Railway: TOMTOM_API_KEY, HERE_API_KEY, MAPBOX_TOKEN, GOOGLE_ROUTES_API_KEY.
-// Порядок — ROUTE_PROVIDERS (по умолчанию tomtom,here,mapbox,google). Лимиты бесплатных тарифов
+// Порядок — ROUTE_PROVIDERS (по умолчанию только tomtom; например «tomtom,here,mapbox,google»). Лимиты бесплатных тарифов
 // взяты с запасом и меняются переменными: TOMTOM_DAILY_LIMIT, HERE_MONTHLY_LIMIT, MAPBOX_MONTHLY_LIMIT.
 // Адреса, GPS и ответы не сохраняем; в базе только счётчики запросов.
 
@@ -153,7 +153,7 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
   const now = options.now || Date.now;
   const env = options.env || process.env;
   const keyOf = name => String(env[PROVIDERS[name].env] || '').trim();
-  const order = () => String(env.ROUTE_PROVIDERS || 'tomtom,here,mapbox,google').split(',').map(s => s.trim().toLowerCase()).filter(n => PROVIDERS[n]);
+  const order = () => String(env.ROUTE_PROVIDERS || 'tomtom').split(',').map(s => s.trim().toLowerCase()).filter(n => PROVIDERS[n]);
   const limitOf = name => { const n = parseInt(env[PROVIDERS[name].limitEnv], 10); return Number.isFinite(n) && n >= 0 ? n : PROVIDERS[name].limit; };
 
   // provider → { key: период, n: запросов }; exhausted — сервис сам сказал «лимит» (до конца периода).
