@@ -173,6 +173,70 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
   }
   const available = name => keyOf(name) && !used(name).exhausted && used(name).n + 2 <= limitOf(name);
 
+  // ---------- где на самом деле адрес с карточки ----------
+
+  /** Варианты текста: целиком; без названия заведения перед улицей; без «Strada/str./ул.». */
+  function variants(text) {
+    const t = text.replace(/\s+/g, ' ').trim();
+    const parts = t.split(',').map(s => s.trim()).filter(Boolean);
+    const out = [t];
+    for (let i = 1; i < parts.length - 1; i++) out.push(parts.slice(i).join(', '));
+    const street = s => s.replace(/(^|,\s*)(strada|str\.|bulevardul|bd\.|bul\.|улица|ул\.|бульвар|бул\.)\s+/giu, '$1');
+    for (const v of [...out]) if (street(v) !== v) out.push(street(v));
+    return [...new Set(out)].slice(0, 5);
+  }
+
+  // Поиск адресов TomTom (тот же ключ): знает румынские названия и сёла лучше нашего геокодера.
+  async function tomtomSearch(q, near) {
+    const key = keyOf('tomtom');
+    if (!key) return [];
+    const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(q.replace(/\//g, ' '))}.json?` +
+      new URLSearchParams({ key, countrySet: 'MD', lat: String(near.lat), lon: String(near.lon), limit: '5' });
+    try {
+      const r = await fetchRoute(url, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) return [];
+      const j = await r.json();
+      return (j.results || []).map(x => ({ lat: x.position?.lat, lon: x.position?.lon })).filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+    } catch { return []; }
+  }
+
+  async function candidates(text, near) {
+    const v = variants(text);
+    const found = [];
+    if (geocoder) for (const q of v.slice(0, 3)) {
+      const r = await geocoder.lookup(q).catch(() => null);
+      if (r?.found) found.push({ lat: r.lat, lon: r.lon });
+    }
+    for (const q of v.slice(0, 2)) found.push(...await tomtomSearch(q, near));
+    return found;
+  }
+
+  const straightKm = (p, q) => {
+    const R = 6371, rad = x => x * Math.PI / 180;
+    const dLat = rad(q.lat - p.lat), dLon = rad(q.lon - p.lon);
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(p.lat)) * Math.cos(rad(q.lat)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  };
+  // По прямой короче, чем по дорогам: дорога ≈ 1,3 × прямой. Сходится, если в разумных пределах.
+  const fits = (straight, card) => card == null || (straight * 1.3 >= card * 0.4 - 0.5 && straight <= card * 1.1 + 1);
+  const miss = (straight, card) => card == null ? 0 : Math.abs(straight * 1.3 - card) / Math.max(card, 1);
+
+  /** Пара А/Б, лучше всех сходящаяся с км на карточке; ничего не сходится — null (покажем данные Bolt). */
+  function choose(ca, cb, me, cardPickup, cardTrip) {
+    let best = null;
+    for (const pa of ca) {
+      const dPick = straightKm(me, pa);
+      if (!fits(dPick, cardPickup)) continue;
+      for (const pb of cb) {
+        const dTrip = straightKm(pa, pb);
+        if (!fits(dTrip, cardTrip) || dTrip < 0.05) continue;
+        const score = miss(dPick, cardPickup) + miss(dTrip, cardTrip);
+        if (!best || score < best.score) best = { pa, pb, score };
+      }
+    }
+    return best ? { pa: best.pa, pb: best.pb } : { pa: null, pb: null };
+  }
+
   app.post('/api/offer-route', member(async (req, res, deviceId) => {
     res.set?.('Cache-Control', 'no-store');
     const { lat, lon, addresses, boarding_minutes = 0 } = req.body;
@@ -190,11 +254,15 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
 
     const withCountry = v => /moldova|молдов/i.test(v) ? v : `${v}, Moldova`;
     const a = addresses[0].trim(), b = addresses[1].trim();
-    // Координаты адресов — нашим геокодером (свои точки водителей, Яндекс); Google умеет и по тексту.
+    // Км с карточки (Bolt): по ним выбираем, какой из найденных адресов настоящий.
+    const cardKm = v => typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 1000 ? v : null;
+    const cardPickup = cardKm(req.body.card_pickup_km), cardTrip = cardKm(req.body.card_trip_km);
+    // Скриншот: водитель уже не там, где был, — подачу не считаем, только поездку А→Б.
+    const tripOnly = req.body.trip_only === true;
     let pa = null, pb = null;
-    if (queue.some(n => PROVIDERS[n].coords) && geocoder) {
-      const [ra, rb] = await Promise.all([geocoder.lookup(a).catch(() => null), geocoder.lookup(b).catch(() => null)]);
-      if (ra?.found && rb?.found) { pa = { lat: ra.lat, lon: ra.lon }; pb = { lat: rb.lat, lon: rb.lon }; }
+    if (queue.some(n => PROVIDERS[n].coords)) {
+      const [ca, cb] = await Promise.all([candidates(a, { lat, lon }), candidates(b, { lat, lon })]);
+      ({ pa, pb } = choose(ca, cb, { lat, lon }, tripOnly ? null : cardPickup, cardTrip));
     }
     const departure = now() + 2000;
     let lastCode = 'route_provider_error';
@@ -204,6 +272,11 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
       const from = { lat, lon };
       const A = p.coords ? pa : { address: withCountry(a) }, B = p.coords ? pb : { address: withCountry(b) };
       try {
+        if (tripOnly) {
+          const trip = await p.route(fetchRoute, keyOf(name), A, B, departure);
+          count(name, 1);
+          return res.json({ ok: true, provider: name, calculated_at: now(), pickup: null, trip, points: { a: A.lat != null ? A : null, b: B.lat != null ? B : null } });
+        }
         const pickup = await p.route(fetchRoute, keyOf(name), from, A, departure);
         // Пассажир садится после подачи и посадки — поездку считаем с этого времени.
         const trip = await p.route(fetchRoute, keyOf(name), A, B, departure + (pickup.minutes + boarding_minutes) * 60000);

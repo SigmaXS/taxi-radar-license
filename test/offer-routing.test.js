@@ -14,6 +14,8 @@ function reply(url, n) {
   return { routes: [{ distanceMeters: m, duration: `${s}s`, polyline: { encodedPolyline: '_p~iF~ps|U_ulLnnqC' } }] };
 }
 
+// Поиск адресов TomTom в тестах: по умолчанию ничего не находит (адреса даёт наш геокодер).
+let search = async () => ({ ok: false, status: 404, json: async () => ({}) });
 function fixture({ env = {}, status = {}, limited = false } = {}) {
   let handler;
   const calls = [];
@@ -22,6 +24,7 @@ function fixture({ env = {}, status = {}, limited = false } = {}) {
     tooOften: () => limited, geocoder
   }, { env, now: () => 1800000000000,
     fetch: async (url, options = {}) => {
+      if (url.includes('/search/')) return search(url);
       calls.push({ url, ...options, body: options.body ? JSON.parse(options.body) : undefined });
       const name = ['tomtom', 'hereapi', 'mapbox', 'googleapis'].find(x => url.includes(x));
       const code = status[name] || 200;
@@ -97,4 +100,28 @@ test('by default only TomTom is used, even if other keys are present', async () 
   const f = fixture({ env: { HERE_API_KEY: 'h', MAPBOX_TOKEN: 'm' } });
   assert.equal((await f.call()).result.code, 'route_not_configured');
   assert.equal(f.calls.length, 0);
+});
+
+test('address that does not fit the card km is rejected; the fitting candidate is chosen', async () => {
+  const saved = search;
+  // Наш геокодер даёт Б в Кишинёве (3 км), TomTom знает и сёло за 30 км — по карточке поездка 31,5 км.
+  search = async url => ({ ok: true, status: 200, json: async () => ({ results: url.includes('Peresecina')
+    ? [{ position: { lat: 47.03, lon: 28.82 } }, { position: { lat: 47.26, lon: 28.77 } }] : [] }) });
+  try {
+    const f = fixture({ env: { TOMTOM_API_KEY: 't' } });
+    const r = await f.call({ ...request, addresses: ['Zelinski 28/7, Chișinău', 'Bogdan Petriceicu Hasdeu 5, Peresecina'], card_pickup_km: 1.6, card_trip_km: 31.5 });
+    assert.equal(r.status, 200);
+    assert.ok(f.calls[1].url.includes(':47.26,28.77'), f.calls[1].url);
+    // А в 16 км при подаче 1,6 км по карточке — не тот адрес: маршрут не строим.
+    const far = fixture({ env: { TOMTOM_API_KEY: 't' } });
+    const r2 = await far.call({ ...request, lat: 47.15, lon: 28.86, card_pickup_km: 1.6, card_trip_km: 12.2 });
+    assert.equal(r2.result.code, 'route_not_found'); assert.equal(far.calls.length, 0);
+  } finally { search = saved; }
+});
+
+test('screenshot mode routes only the trip leg', async () => {
+  const f = fixture({ env: { TOMTOM_API_KEY: 't' } });
+  const r = await f.call({ ...request, trip_only: true, card_trip_km: 9 });
+  assert.equal(r.status, 200); assert.equal(r.result.pickup, null); assert.equal(f.calls.length, 1);
+  assert.ok(f.calls[0].url.includes('46.99,28.85:47.03,28.8'));
 });
