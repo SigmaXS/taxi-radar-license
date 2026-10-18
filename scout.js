@@ -108,7 +108,14 @@ module.exports = function registerScout(app, { member }, options = {}) {
   }));
 
   /** Для админки и проверки: сколько точек ждут и сколько свежих результатов. */
-  return () => { prune(); return { wanted: wanted.size, results: results.size, scouts: scouts().length }; };
+  return () => {
+    prune();
+    const t = now();
+    const fresh = [...results.values()].filter(r => t - r.at <= FRESH_MS);
+    const last = Math.max(0, ...[...results.values()].map(r => r.at));
+    return { scouts: scouts().length, wanted: wanted.size, fresh: fresh.length,
+      hot: fresh.filter(r => r.value > 0).length, lastAgeSec: last ? Math.round((t - last) / 1000) : null };
+  };
 };
 
 module.exports.single = single;

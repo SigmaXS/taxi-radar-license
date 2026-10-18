@@ -186,16 +186,36 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
     return [...new Set(out)].slice(0, 5);
   }
 
-  async function candidates(text) {
-    // Only Yandex geocodes. TomTom receives coordinates, never address text.
-    if (!geocoder?.lookupRoute) return [];
-    for (const q of variants(text).slice(0, 3)) {
+  // Поиск адресов TomTom (тот же ключ): знает румынские названия и сёла, где геокодер Яндекса молчит
+  // («Strada Nicolae Zelinski 28/7», «Hasdeu 5, Peresecina»). Несколько вариантов — правильный выберет choose() по км карточки.
+  async function tomtomSearch(q, near) {
+    const key = keyOf('tomtom');
+    if (!key) return [];
+    const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(q.replace(/\//g, ' '))}.json?` +
+      new URLSearchParams({ key, countrySet: 'MD', lat: String(near.lat), lon: String(near.lon), limit: '5' });
+    try {
+      const r = await fetchRoute(url, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) return [];
+      const j = await r.json();
+      return (j.results || []).map(x => ({ lat: x.position?.lat, lon: x.position?.lon })).filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+    } catch { return []; }
+  }
+
+  async function candidates(text, near) {
+    // Сначала геокодер Яндекса (точный ответ); затем варианты TomTom — пара, сходящаяся с км карточки, решит.
+    const found = [];
+    if (geocoder?.lookupRoute) for (const q of variants(text).slice(0, 3)) {
       const r = await geocoder.lookupRoute(q).catch(() => null);
       if (r?.found && r.source === 'yandex' && !r.approx && Number.isFinite(r.lat) && Number.isFinite(r.lon)) {
-        return [{ lat: r.lat, lon: r.lon }];
+        found.push({ lat: r.lat, lon: r.lon }); break;
       }
     }
-    return [];
+    if (near) for (const q of variants(text).slice(0, 2)) found.push(...await tomtomSearch(q, near));
+    // Улицы в селе нет ни у кого («Hasdeu 5, Peresecina») — центр самого села: для дальней поездки точности хватает.
+    const parts = text.split(',').map(s => s.trim()).filter(Boolean);
+    const place = parts.length > 1 ? parts[parts.length - 1].replace(/\d{4}/g, '').trim() : '';
+    if (near && place.length >= 4 && !/\d/.test(place) && !/chi[șs]in[ăa]u|кишин/iu.test(place)) found.push(...await tomtomSearch(place, near));
+    return found;
   }
 
   const straightKm = (p, q) => {

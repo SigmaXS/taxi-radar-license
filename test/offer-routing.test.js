@@ -143,3 +143,14 @@ test('TomTom departure timestamps retain UTC zone and pickup delay', async () =>
   assert.equal(Date.parse(start.get('departAt')), 1800000002000);
   assert.equal(Date.parse(next.get('departAt')) - Date.parse(start.get('departAt')), 7 * 60000);
 });
+
+test('village street unknown to search: the village centre is used if it fits the card km', async () => {
+  const saved = search;
+  search = async url => ({ ok: true, status: 200, json: async () => ({ results: url.includes('/Peresecina.json')
+    ? [{ position: { lat: 47.25, lon: 28.768 } }] : [] }) });
+  try {
+    const f = fixture({ env: { TOMTOM_API_KEY: 't' } });
+    const r = await f.call({ ...request, addresses: ['Zelinski 28/7, Chișinău', 'Bogdan Petriceicu Hasdeu 5, Peresecina'], card_trip_km: 31.5, trip_only: true });
+    assert.equal(r.status, 200, JSON.stringify(r.result));
+  } finally { search = saved; }
+});
