@@ -108,7 +108,7 @@ module.exports = function createGeocoder(pool) {
   }
 
   // null — Яндекс не нашёл; throw — ключ не подошёл или Яндекс недоступен.
-  async function askYandex(q, key) {
+  async function askYandex(q, key, routeOnly = false) {
     used.set(key, (used.get(key) || 0) + 1);
     const url = 'https://geocode-maps.yandex.ru/1.x/?apikey=' + encodeURIComponent(key) +
       '&geocode=' + encodeURIComponent(q) +
@@ -128,8 +128,8 @@ module.exports = function createGeocoder(pool) {
     const points = members.map(m => {
       const [lon, lat] = m.GeoObject.Point.pos.split(' ').map(Number);
       const meta = (m.GeoObject.metaDataProperty || {}).GeocoderMetaData || {};
-      return { lat, lon, precision: meta.precision };
-    }).filter(p => haversineKm(p, CENTER) <= MAX_FROM_CENTER_KM);
+      return { lat, lon, precision: meta.precision, routeMatch: !routeOnly || routeAddressMatches(q, meta) };
+    }).filter(p => p.routeMatch && haversineKm(p, CENTER) <= MAX_FROM_CENTER_KM);
     const best = points.find(p => GOOD_PRECISION.includes(p.precision)) || points[0];
     // approx — дом не найден: точка на улице или в районе.
     return best ? { lat: best.lat, lon: best.lon, approx: !GOOD_PRECISION.includes(best.precision) } : null;
@@ -230,10 +230,10 @@ module.exports = function createGeocoder(pool) {
     return await osm(t);
   }
 
-  async function askAnyKey(q) {
+  async function askAnyKey(q, routeOnly = false) {
     for (const key of usableKeys()) {
       try {
-        return { point: await askYandex(q, key) };
+        return { point: await askYandex(q, key, routeOnly) };
       } catch (err) {
         console.error('Geocoder:', err.message);
         if (err.status !== 403 && err.status !== 429) return null; // сеть — другой ключ не поможет
@@ -312,6 +312,26 @@ module.exports = function createGeocoder(pool) {
     } finally {
       inFlight.delete(q);
     }
+  }
+
+  // Routing must never reuse old mixed-source cache entries or learned driver GPS points.
+  const routeCache = new Map();
+  async function lookupRoute(rawQuery) {
+    const q = normalize(rawQuery), key = `route:${q}`;
+    const cached = routeCache.get(q);
+    if (cached && cached.until > Date.now()) return cached.value;
+    if (inFlight.has(key)) return inFlight.get(key);
+    const job = (async () => {
+      const answer = await askAnyKey(rawQuery, true);
+      if (!answer) return null;
+      const p = answer.point;
+      const value = p ? { found: true, lat: p.lat, lon: p.lon, approx: false, source: 'yandex' } : { found: false };
+      if (routeCache.size >= 500) routeCache.delete(routeCache.keys().next().value);
+      routeCache.set(q, { value, until: Date.now() + (p ? 600000 : 60000) });
+      return value;
+    })();
+    inFlight.set(key, job);
+    try { return await job; } finally { inFlight.delete(key); }
   }
 
   // Приложение не смогло найти адрес ни у нас, ни у Яндекса — в список для админа.
@@ -406,5 +426,21 @@ module.exports = function createGeocoder(pool) {
     };
   }
 
-  return { lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize, findAny, autoResolveMisses };
+  return { lookupRoute, lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize, findAny, autoResolveMisses };
 };
+
+// Yandex coordinates used for routing must resolve the requested locality and a house, not a district centroid.
+function routeAddressMatches(query, meta) {
+  const canonical = value => String(value || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/ё/g, 'е');
+  const aliases = value => ({ 'кишинев': 'chisinau', 'тирасполь': 'tiraspol', 'пересечина': 'peresecina', 'пересечино': 'peresecina' }[canonical(value)] || canonical(value));
+  const parts = String(query).split(',').map(s => s.trim()).filter(s => s && !/^(moldova|молдова)$/iu.test(s));
+  const tail = parts.at(-1)?.replace(/\s+\d{4}\s*$/u, '');
+  const wanted = parts.length > 1 && tail && !/\d/.test(tail) && !/^(strada|str\.|улица|ул\.|пер\.|бульвар)\s/iu.test(tail) ? aliases(tail) : null;
+  const localities = (meta.Address?.Components || []).filter(c => c.kind === 'locality').map(c => aliases(c.name));
+  if (wanted && !localities.includes(wanted)) return false;
+  if (!['exact', 'number'].includes(meta.precision)) return false;
+  // Query house numbers can include / or letters; the provider must still identify a house.
+  if (/\d/.test(parts.slice(0, -1).join(' ') || query) && meta.kind !== 'house') return false;
+  return !['locality', 'district', 'province', 'area', 'country'].includes(meta.kind);
+}
+module.exports.routeAddressMatches = routeAddressMatches;

@@ -208,6 +208,8 @@ app.get('/api/app-config', (req, res) => {
     group_url: process.env.GROUP_URL ?? 'https://t.me/taxi_radar_chisinau',
     // Ключ Яндекс Tiles API для карты спроса (бесплатный, общий на всех).
     tiles_api_key: process.env.TILES_API_KEY || '',
+    // Одна буквальная замена на строку: найдено => правильно. Общий словарь для клиентов Bolt.
+    bolt_ocr_corrections: (process.env.BOLT_OCR_CORRECTIONS || '').slice(0, 10000),
     // Адреса ищет сервер (geocoder.js) — водителю не нужен свой ключ Яндекса.
     shared_geocoder: Object.keys(process.env).some(k => /^YANDEX_GEOCODER_KEY(_\d)?$/.test(k) && process.env[k].trim()),
     referral_bonus_days: referralBonusDays(),

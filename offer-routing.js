@@ -81,7 +81,7 @@ const PROVIDERS = {
     env: 'TOMTOM_API_KEY', period: 'day', limitEnv: 'TOMTOM_DAILY_LIMIT', limit: 2000, coords: true,
     async route(fetch, key, from, to, departure) {
       const url = `https://api.tomtom.com/routing/1/calculateRoute/${from.lat},${from.lon}:${to.lat},${to.lon}/json?` +
-        new URLSearchParams({ key, traffic: 'true', travelMode: 'car', routeType: 'fastest', departAt: new Date(departure).toISOString().slice(0, 19) });
+        new URLSearchParams({ key, traffic: 'true', travelMode: 'car', routeType: 'fastest', departAt: new Date(departure).toISOString() });
       const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
       if (r.status === 429 || r.status === 403) throw new LimitError();
       if (!r.ok) throw new Error('route_provider_error');
@@ -97,7 +97,7 @@ const PROVIDERS = {
     async route(fetch, key, from, to, departure) {
       const url = 'https://router.hereapi.com/v8/routes?' + new URLSearchParams({
         transportMode: 'car', origin: `${from.lat},${from.lon}`, destination: `${to.lat},${to.lon}`,
-        return: 'summary,polyline', departureTime: new Date(departure).toISOString().slice(0, 19), apikey: key });
+        return: 'summary,polyline', departureTime: new Date(departure).toISOString(), apikey: key });
       const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
       if (r.status === 429 || r.status === 403) throw new LimitError();
       if (!r.ok) throw new Error('route_provider_error');
@@ -113,7 +113,7 @@ const PROVIDERS = {
     async route(fetch, key, from, to, departure) {
       const params = { access_token: key, geometries: 'polyline', overview: 'full' };
       // depart_at — только в будущем; для подачи (сейчас) не передаём: driving-traffic и так берёт текущие пробки.
-      if (departure > Date.now() + 60000) params.depart_at = new Date(departure).toISOString().slice(0, 16);
+      if (departure > Date.now() + 60000) params.depart_at = new Date(departure).toISOString();
       const url = `https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${from.lon},${from.lat};${to.lon},${to.lat}?` + new URLSearchParams(params);
       const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
       if (r.status === 429 || r.status === 401 || r.status === 403) throw new LimitError();
@@ -186,29 +186,16 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
     return [...new Set(out)].slice(0, 5);
   }
 
-  // Поиск адресов TomTom (тот же ключ): знает румынские названия и сёла лучше нашего геокодера.
-  async function tomtomSearch(q, near) {
-    const key = keyOf('tomtom');
-    if (!key) return [];
-    const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(q.replace(/\//g, ' '))}.json?` +
-      new URLSearchParams({ key, countrySet: 'MD', lat: String(near.lat), lon: String(near.lon), limit: '5' });
-    try {
-      const r = await fetchRoute(url, { signal: AbortSignal.timeout(5000) });
-      if (!r.ok) return [];
-      const j = await r.json();
-      return (j.results || []).map(x => ({ lat: x.position?.lat, lon: x.position?.lon })).filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
-    } catch { return []; }
-  }
-
-  async function candidates(text, near) {
-    const v = variants(text);
-    const found = [];
-    if (geocoder) for (const q of v.slice(0, 3)) {
-      const r = await geocoder.lookup(q).catch(() => null);
-      if (r?.found) found.push({ lat: r.lat, lon: r.lon });
+  async function candidates(text) {
+    // Only Yandex geocodes. TomTom receives coordinates, never address text.
+    if (!geocoder?.lookupRoute) return [];
+    for (const q of variants(text).slice(0, 3)) {
+      const r = await geocoder.lookupRoute(q).catch(() => null);
+      if (r?.found && r.source === 'yandex' && !r.approx && Number.isFinite(r.lat) && Number.isFinite(r.lon)) {
+        return [{ lat: r.lat, lon: r.lon }];
+      }
     }
-    for (const q of v.slice(0, 2)) found.push(...await tomtomSearch(q, near));
-    return found;
+    return [];
   }
 
   const straightKm = (p, q) => {
@@ -247,7 +234,7 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
         typeof boarding_minutes !== 'number' || !Number.isFinite(boarding_minutes) || boarding_minutes < 0 || boarding_minutes > 30) {
       return res.status(400).json({ ok: false, code: 'route_invalid_input' });
     }
-    const queue = order().filter(available);
+    const queue = order().filter(name => PROVIDERS[name].coords && available(name));
     if (!queue.length) return res.status(503).json({ ok: false, code: 'route_not_configured' });
     // Карточка читается раз в секунду — запросы к сервисам ограничиваем.
     if (tooOften(`offer-route:${deviceId}`, 20, 60000)) return res.status(429).json({ ok: false, code: 'route_rate_limit' });

@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const register = require('../offer-routing');
 const request = { lat: 47.01, lon: 28.86, addresses: ['Zelinski 28/7, Chișinău', 'Bucovinei 5, Chișinău'], boarding_minutes: 2 };
-const geocoder = { lookup: async q => q.startsWith('Zelinski') ? { found: true, lat: 46.99, lon: 28.85 } : { found: true, lat: 47.03, lon: 28.80 } };
+const geocoder = { lookupRoute: async q => q.startsWith('Zelinski') ? { source: 'yandex', found: true, lat: 46.99, lon: 28.85 } : { source: 'yandex', found: true, lat: 47.03, lon: 28.80 } };
 
 // Ответы сервисов: подача 1,6 км / 5 мин, поездка 12,2 км / 36 мин.
 function reply(url, n) {
@@ -16,12 +16,12 @@ function reply(url, n) {
 
 // Поиск адресов TomTom в тестах: по умолчанию ничего не находит (адреса даёт наш геокодер).
 let search = async () => ({ ok: false, status: 404, json: async () => ({}) });
-function fixture({ env = {}, status = {}, limited = false } = {}) {
+function fixture({ env = {}, status = {}, limited = false, routeGeocoder = geocoder } = {}) {
   let handler;
   const calls = [];
   const stats = register({ post: (_, fn) => { handler = fn; } }, {
     member: fn => (req, res) => fn(req, res, 'licensed-test-driver'),
-    tooOften: () => limited, geocoder
+    tooOften: () => limited, geocoder: routeGeocoder
   }, { env, now: () => 1800000000000,
     fetch: async (url, options = {}) => {
       if (url.includes('/search/')) return search(url);
@@ -63,13 +63,10 @@ test('own free limit stops using a provider before it bills', async () => {
   assert.equal((await f.call()).result.provider, 'mapbox');
 });
 
-test('order is configurable; google works by address text', async () => {
+test('text-routing providers cannot bypass Yandex coordinate resolution', async () => {
   const f = fixture({ env: { ROUTE_PROVIDERS: 'google,tomtom', GOOGLE_ROUTES_API_KEY: 'g', TOMTOM_API_KEY: 't' } });
-  const r = await f.call();
-  assert.equal(r.result.provider, 'google');
-  assert.equal(f.calls[0].body.routingPreference, 'TRAFFIC_AWARE_OPTIMAL');
-  assert.equal(f.calls[1].body.destination.address, 'Bucovinei 5, Chișinău, Moldova');
-  assert.equal(Date.parse(f.calls[1].body.departureTime) - Date.parse(f.calls[0].body.departureTime), 7 * 60000);
+  assert.equal((await f.call()).result.provider, 'tomtom');
+  assert.equal(f.calls.some(c => c.url.includes('googleapis')), false);
 });
 
 test('no keys, all failures and bad input never return made-up times', async () => {
@@ -102,21 +99,20 @@ test('by default only TomTom is used, even if other keys are present', async () 
   assert.equal(f.calls.length, 0);
 });
 
-test('address that does not fit the card km is rejected; the fitting candidate is chosen', async () => {
-  const saved = search;
-  // Наш геокодер даёт Б в Кишинёве (3 км), TomTom знает и сёло за 30 км — по карточке поездка 31,5 км.
-  search = async url => ({ ok: true, status: 200, json: async () => ({ results: url.includes('Peresecina')
-    ? [{ position: { lat: 47.03, lon: 28.82 } }, { position: { lat: 47.26, lon: 28.77 } }] : [] }) });
-  try {
-    const f = fixture({ env: { TOMTOM_API_KEY: 't' } });
-    const r = await f.call({ ...request, addresses: ['Zelinski 28/7, Chișinău', 'Bogdan Petriceicu Hasdeu 5, Peresecina'], card_pickup_km: 1.6, card_trip_km: 31.5 });
-    assert.equal(r.status, 200);
-    assert.ok(f.calls[1].url.includes(':47.26,28.77'), f.calls[1].url);
-    // А в 16 км при подаче 1,6 км по карточке — не тот адрес: маршрут не строим.
-    const far = fixture({ env: { TOMTOM_API_KEY: 't' } });
-    const r2 = await far.call({ ...request, lat: 47.15, lon: 28.86, card_pickup_km: 1.6, card_trip_km: 12.2 });
-    assert.equal(r2.result.code, 'route_not_found'); assert.equal(far.calls.length, 0);
-  } finally { search = saved; }
+test('only Yandex coordinates are routed; no TomTom address search or distance-based substitution', async () => {
+  const selected = { lookupRoute: async q => ({ source: 'yandex', found: true,
+    lat: q.includes('Peresecina') ? 47.26 : 46.99, lon: q.includes('Peresecina') ? 28.77 : 28.85 }) };
+  const f = fixture({ env: { TOMTOM_API_KEY: 't' }, routeGeocoder: selected });
+  const r = await f.call({ ...request, addresses: ['Zelinski 28/7, Chișinău', 'Hasdeu 5, Peresecina'], trip_only: true, card_trip_km: 31.5 });
+  assert.equal(r.status, 200);
+  assert.ok(f.calls[0].url.includes('46.99,28.85:47.26,28.77'));
+  assert.equal(f.calls.some(c => c.url.includes('/search/')), false);
+  const absent = fixture({ env: { TOMTOM_API_KEY: 't' }, routeGeocoder: { lookupRoute: async () => ({found: false}) } });
+  assert.equal((await absent.call()).result.code, 'route_not_found');
+  assert.equal(absent.calls.length, 0);
+  const mixed = fixture({ env: { TOMTOM_API_KEY: 't' }, routeGeocoder: { lookupRoute: async () => ({found: true, source: 'osm', lat: 47, lon: 28.8}) } });
+  assert.equal((await mixed.call()).result.code, 'route_not_found');
+  assert.equal(mixed.calls.length, 0);
 });
 
 test('screenshot mode routes only the trip leg', async () => {
@@ -124,4 +120,26 @@ test('screenshot mode routes only the trip leg', async () => {
   const r = await f.call({ ...request, trip_only: true, card_trip_km: 9 });
   assert.equal(r.status, 200); assert.equal(r.result.pickup, null); assert.equal(f.calls.length, 1);
   assert.ok(f.calls[0].url.includes('46.99,28.85:47.03,28.8'));
+});
+
+test('Yandex rejects Bucovinei in Stauceni and city-only centroids', () => {
+  const match = require('../geocoder').routeAddressMatches;
+  const house = city => ({ precision: 'exact', kind: 'house', Address: {Components: [{kind: 'locality', name: city}]} });
+  assert.equal(match('Strada Bucovinei 5, Chișinău, Moldova', house('Кишинёв')), true);
+  assert.equal(match('Strada Bucovinei 5, Chișinău, Moldova', house('Stăuceni')), false);
+  assert.equal(match('Hasdeu 5, Peresecina', house('Chișinău')), false);
+  assert.equal(match('Hasdeu 5, Peresecina', house('Peresecina')), true);
+  assert.equal(match('Bucovinei 5, Chișinău', {...house('Кишинёв'), kind: 'locality'}), false);
+  assert.equal(match('Bucovinei 5, Chișinău', {...house('Кишинёв'), precision: 'near'}), false);
+});
+
+test('TomTom departure timestamps retain UTC zone and pickup delay', async () => {
+  const f = fixture({ env: { TOMTOM_API_KEY: 'test' } });
+  assert.equal((await f.call()).status, 200);
+  const start = new URL(f.calls[0].url).searchParams;
+  const next = new URL(f.calls[1].url).searchParams;
+  assert.equal(start.get('traffic'), 'true');
+  assert.match(start.get('departAt'), /Z$/);
+  assert.equal(Date.parse(start.get('departAt')), 1800000002000);
+  assert.equal(Date.parse(next.get('departAt')) - Date.parse(start.get('departAt')), 7 * 60000);
 });
