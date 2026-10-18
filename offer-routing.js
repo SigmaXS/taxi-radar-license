@@ -192,7 +192,7 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
     const key = keyOf('tomtom');
     if (!key) return [];
     const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(q.replace(/\//g, ' '))}.json?` +
-      new URLSearchParams({ key, countrySet: 'MD', lat: String(near.lat), lon: String(near.lon), limit: '5' });
+      new URLSearchParams({ key, countrySet: 'MD', language: 'ro-RO', lat: String(near.lat), lon: String(near.lon), limit: '5' });
     try {
       const r = await fetchRoute(url, { signal: AbortSignal.timeout(5000) });
       if (!r.ok) return [];
