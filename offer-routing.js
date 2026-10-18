@@ -237,7 +237,9 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
       for (const pb of cb) {
         const dTrip = straightKm(pa, pb);
         if (!fits(dTrip, cardTrip) || dTrip < 0.05) continue;
-        const score = miss(dPick, cardPickup) + miss(dTrip, cardTrip);
+        // Подача неизвестна (скриншот) — при прочих равных А ближе к водителю: одноимённая улица
+        // в другом городе («Pușkin 44» в Анений Ной) проигрывает кишинёвской.
+        const score = miss(dPick, cardPickup) + miss(dTrip, cardTrip) + (cardPickup == null ? dPick * 0.02 : 0);
         if (!best || score < best.score) best = { pa, pb, score };
       }
     }

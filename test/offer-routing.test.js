@@ -154,3 +154,17 @@ test('village street unknown to search: the village centre is used if it fits th
     assert.equal(r.status, 200, JSON.stringify(r.result));
   } finally { search = saved; }
 });
+
+test('screenshot mode: same street in another town loses to the one near the driver', async () => {
+  const saved = search;
+  search = async url => ({ ok: true, status: 200, json: async () => ({ results:
+    url.includes('Pu') ? [{ position: { lat: 47.0268, lon: 28.8392 } }, { position: { lat: 46.8774, lon: 29.2472 } }]
+    : url.includes('/Peresecina.json') ? [{ position: { lat: 47.2501, lon: 28.7679 } }]
+    : [{ position: { lat: 47.0344, lon: 28.8394 } }, { position: { lat: 47.0393, lon: 28.9509 } }] }) });
+  try {
+    const f = fixture({ env: { TOMTOM_API_KEY: 't' } });
+    const r = await f.call({ lat: 47.0245, lon: 28.8353, addresses: ['Pușkin, Blocul Pușkin 44', 'Bogdan Petriceicu Hasdeu 5, Peresecina'], boarding_minutes: 0, card_trip_km: 31.5, trip_only: true });
+    assert.equal(r.status, 200);
+    assert.ok(f.calls[0].url.includes('47.0268,28.8392:47.2501,28.7679'), f.calls[0].url);
+  } finally { search = saved; }
+});
