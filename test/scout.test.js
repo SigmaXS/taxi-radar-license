@@ -89,10 +89,25 @@ test('few driver points are rechecked every 20 s, many every minute', async () =
   await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
   f.tick(25e3);
   assert.equal((await f.call('/api/scout/tasks', {}, 'scout-1')).points.length, 1, 'one driver: due again after 20 s');
-  for (let i = 0; i < 6; i++) await f.call('/api/scout/near', { lat: 47.01 + i * 0.01, lon: 28.85 });
+  for (let i = 0; i < 6; i++) await f.call('/api/scout/near', { lat: 47.01 + i * 0.01, lon: 28.85 }, 'driver-' + (i + 2));
   await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 });
   await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
   f.tick(25e3);
   const t = await f.call('/api/scout/tasks', {}, 'scout-1');
   assert.ok(!t.points.some(p => Math.abs(p.lat - 47.0) < 1e-9), 'seven drivers: not due after 25 s');
+});
+
+test('a driver who moved: the old point leaves the queue at once', async () => {
+  const f = fixture();
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }, 'driver-1');
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }, 'driver-2');
+  await f.call('/api/scout/near', { lat: 47.02, lon: 28.85 }, 'driver-1'); // уехал
+  let t = await f.call('/api/scout/tasks', {}, 'scout-1');
+  assert.equal(t.points.length, 2, 'driver-2 still stands at the old point');
+  f.tick(30e3);
+  await f.call('/api/scout/near', { lat: 47.04, lon: 28.85 }, 'driver-2'); // и этот уехал
+  await f.call('/api/scout/near', { lat: 47.02, lon: 28.85 }, 'driver-1');
+  f.tick(30e3);
+  t = await f.call('/api/scout/tasks', {}, 'scout-1');
+  assert.ok(!t.points.some(p => Math.abs(p.lat - 47.0) < 1e-9), 'nobody at the old point any more');
 });

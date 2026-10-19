@@ -47,6 +47,8 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
 
   function prune() {
     const t = now();
+    // Радар замолчал (выключен, нет связи) — через 3 минуты его точки уходят из очереди.
+    for (const [dev, d] of byDevice) if (t - d.at > WANT_MS) { forget(dev, false); forget(dev, true); byDevice.delete(dev); }
     for (const [k, w] of wanted) if (t - w.at > WANT_MS) wanted.delete(k);
     for (const [k, r] of results) if (t - r.at > FRESH_MS * 3) results.delete(k);
   }
@@ -62,30 +64,50 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     return best?.r || null;
   }
 
-  function want(lat, lon, b) {
+  // Чья точка: водитель уехал — его старая клетка сразу уходит из очереди (если там больше никого),
+  // а не висит ещё 3 минуты. Так же с точкой Б: новая заменяет старую, нет Б — заказ кончился.
+  const byDevice = new Map(); // device → { here: клетка, b: клетка Б, at }
+  function release(key, dev, isB) {
+    const w = key && wanted.get(key);
+    if (!w) return;
+    (isB ? w.bs : w.here).delete(dev);
+    if (!w.here.size && !w.bs.size) wanted.delete(key); else w.b = w.here.size === 0;
+  }
+  function want(lat, lon, isB, dev) {
     const key = cellOf(lat, lon);
-    const w = wanted.get(key) || { at: 0, lease: 0, b: true };
-    w.at = now(); w.b = w.b && b; // точка, где стоит хоть один водитель, важнее точки Б
+    const d = byDevice.get(dev) || {};
+    const prev = isB ? d.b : d.here;
+    if (prev && prev !== key) release(prev, dev, isB);
+    const w = wanted.get(key) || { at: 0, lease: 0, here: new Set(), bs: new Set(), b: true };
+    (isB ? w.bs : w.here).add(dev);
+    w.at = now(); w.b = w.here.size === 0; // точка, где стоит хоть один водитель, важнее точки Б
     wanted.set(key, w);
+    if (isB) d.b = key; else d.here = key;
+    d.at = now(); byDevice.set(dev, d);
+  }
+  function forget(dev, isB) {
+    const d = byDevice.get(dev);
+    if (!d) return;
+    if (isB) { release(d.b, dev, true); d.b = null; } else { release(d.here, dev, false); d.here = null; }
   }
 
   // Радар водителя, раз в минуту: «я здесь» (и куда везу — b_lat/b_lon) → надбавка разведчика рядом.
-  app.post('/api/scout/near', member(async (req, res) => {
+  app.post('/api/scout/near', member(async (req, res, deviceId) => {
     const { lat, lon, b_lat, b_lon } = req.body;
     if (!okCoord(lat, lon)) return res.status(400).json({ ok: false, code: 'bad_point' });
     prune();
     const out = { ok: true };
-    if (km(CENTER, { lat, lon }) > radiusKm()) { out.surge = 0; out.far = true; }
+    if (km(CENTER, { lat, lon }) > radiusKm()) { out.surge = 0; out.far = true; forget(deviceId, false); }
     else {
-      want(lat, lon, false);
+      want(lat, lon, false, deviceId);
       const r = nearest({ lat, lon });
       if (r) Object.assign(out, { surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
       else Object.assign(out, { surge: null, scouting: scouts().length > 0 });
     }
     if (okCoord(b_lat, b_lon)) {
       if (km(CENTER, { lat: b_lat, lon: b_lon }) > radiusKm()) out.surge_b = 0;
-      else { want(b_lat, b_lon, true); const rb = nearest({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
-    }
+      else { want(b_lat, b_lon, true, deviceId); const rb = nearest({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
+    } else forget(deviceId, true);
     res.json(out);
   }));
 
