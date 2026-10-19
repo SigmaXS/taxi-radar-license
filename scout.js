@@ -149,6 +149,19 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     res.json({ ok: true, value });
   }));
 
+  // Разведчик (и проверка с его ID): очередь как есть — ничего не выдаёт и не бронирует.
+  app.post('/api/scout/queue', member(async (req, res, deviceId) => {
+    if (!scouts().includes(deviceId)) return res.status(403).json({ ok: false, code: 'not_scout' });
+    prune();
+    const t = now();
+    const drivers = [...wanted.values()].filter(w => !w.b).length;
+    res.json({ ok: true, recheck_s: (drivers <= FEW ? RECHECK_FEW_MS : RECHECK_MS) / 1000, points: [...wanted.entries()].map(([k, w]) => {
+      const p = centerOf(k), r = results.get(k);
+      return { lat: +p.lat.toFixed(4), lon: +p.lon.toFixed(4), b: w.b, drivers: w.here.size, seen_s: Math.round((t - w.at) / 1000),
+        leased: w.lease > t, checked_s: r ? Math.round((t - r.at) / 1000) : null, value: r ? r.value : undefined, values: r ? r.values : undefined };
+    }) });
+  }));
+
   // Админка: очередь разведчика — какие точки, когда водитель там был и когда проверено (страница обновляется сама).
   app.get('/admin/scout', (req, res) => {
     prune();
