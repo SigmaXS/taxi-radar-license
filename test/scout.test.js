@@ -123,3 +123,9 @@ test('driver on the move: a fresh check within 1.2 km is used until the new poin
   f.tick(4 * 60e3);
   assert.equal((await f.call('/api/scout/near', { lat: 47.008, lon: 28.85 }, 'driver-8')).surge, null, 'too old for the fallback');
 });
+
+test("scout phones' own location is not queued", async () => {
+  const f = fixture();
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }, 'scout-1');
+  assert.equal((await f.call('/api/scout/tasks', {}, 'scout-1')).points.length, 0);
+});

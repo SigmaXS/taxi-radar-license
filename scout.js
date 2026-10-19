@@ -39,7 +39,7 @@ function single(values) {
   return [...count.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0];
 }
 
-module.exports = function registerScout(app, { member, escapeHtml = s => String(s) }, options = {}) {
+module.exports = function registerScout(app, { member, escapeHtml = s => String(s), pool }, options = {}) {
   const now = options.now || Date.now;
   const env = options.env || process.env;
   const radiusKm = () => { const n = parseFloat(env.SCOUT_RADIUS_KM); return Number.isFinite(n) && n > 0 ? n : 20; };
@@ -47,6 +47,19 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
 
   const wanted = new Map();   // cell → { at: последний раз водитель тут, lease: до когда выдана разведчику }
   const results = new Map();  // cell → { at, value, values, lat, lon }
+  // Проверки — и в базе: перезапуск сервера (каждая заливка) не должен обнулять надбавку у всех водителей.
+  if (pool) {
+    pool.query(`CREATE TABLE IF NOT EXISTS scout_results (cell VARCHAR(30) PRIMARY KEY, at BIGINT NOT NULL, value INT, vals TEXT, lat DOUBLE PRECISION, lon DOUBLE PRECISION)`)
+      .then(() => pool.query('SELECT * FROM scout_results WHERE at > $1', [now() - FRESH_MS]))
+      .then(r => r.rows.forEach(x => { if (!results.has(x.cell)) results.set(x.cell, { at: Number(x.at), value: x.value, values: JSON.parse(x.vals || '{}'), lat: x.lat, lon: x.lon }); }))
+      .catch(e => console.error('scout_results:', e.message));
+  }
+  function store(key, r) {
+    results.set(key, r);
+    if (pool) pool.query(`INSERT INTO scout_results (cell, at, value, vals, lat, lon) VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (cell) DO UPDATE SET at = $2, value = $3, vals = $4, lat = $5, lon = $6`,
+      [key, r.at, r.value, JSON.stringify(r.values), r.lat, r.lon]).catch(() => {});
+  }
 
   function prune() {
     const t = now();
@@ -103,14 +116,15 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     const out = { ok: true };
     if (km(CENTER, { lat, lon }) > radiusKm()) { out.surge = 0; out.far = true; forget(deviceId, false); }
     else {
-      want(lat, lon, false, deviceId);
+      // Телефоны-разведчики лежат дома с Яндекс Go — их собственное место проверять незачем.
+      if (!scouts().includes(deviceId)) want(lat, lon, false, deviceId);
       const r = nearestOrAround({ lat, lon });
       if (r) Object.assign(out, { surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
       else Object.assign(out, { surge: null, scouting: scouts().length > 0 });
     }
     if (okCoord(b_lat, b_lon)) {
       if (km(CENTER, { lat: b_lat, lon: b_lon }) > radiusKm()) out.surge_b = 0;
-      else { want(b_lat, b_lon, true, deviceId); const rb = nearestOrAround({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
+      else { if (!scouts().includes(deviceId)) want(b_lat, b_lon, true, deviceId); const rb = nearestOrAround({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
     } else forget(deviceId, true);
     res.json(out);
   }));
@@ -144,7 +158,7 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     const value = single(values);
     const key = cellOf(lat, lon);
     // Ни по одному тарифу нет машин — «нет данных», а не 0; клетка снова встанет в очередь через минуту.
-    results.set(key, { at: now(), value, values, lat, lon });
+    store(key, { at: now(), value, values, lat, lon });
     const w = wanted.get(key); if (w) w.lease = 0;
     const spread = Object.values(values).filter(Number.isInteger);
     if (spread.length > 1 && Math.max(...spread) !== Math.min(...spread)) {

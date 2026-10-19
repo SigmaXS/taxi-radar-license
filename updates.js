@@ -29,7 +29,33 @@ async function init(pool) {
 ]*справлен неверный показ', E'
 🛠 Исправлен неверный показ')
      WHERE sha256 = 'fa63b7e40621bb2d732bfd8add2eddcd7b70678c6b673de80db1f1cf8210abbf' AND version_code = 23`);
+  await importBundled(pool);
   await refresh(pool);
+}
+
+// Выпуск без админки (у владельца плохой интернет): APK из builds/ загружается при запуске один раз.
+// Следующим коммитом файл и этот блок убираются.
+const BUNDLED = { file: 'builds/TaxiRadar-2.3.1.apk', code: 24, name: '2.3.1', notes: [
+  '🛠 2.3.1: надбавка обновляется быстрее, когда вы едете; исправлены мелкие ошибки',
+  '',
+  'Что нового в 2.3:',
+  '🚗 Bolt — всё как в Яндексе: цена, сколько останется чистыми, время всего заказа, L/км и L/час прямо поверх заказа',
+  '⏱ Реальное время поездки с учётом пробок — Bolt часто занижает',
+  '💰 Заказы Bolt сами попадают в смену: наличные или карта, компенсация Bolt отдельно',
+  '📊 В смене и «Моих поездках» видно, где Яндекс, а где Bolt',
+  '✅ Надбавка снова работает',
+  '⚙️ Настройки Bolt / Яндекс: можно работать только с одним сервисом или с обоими'].join('\n') };
+async function importBundled(pool) {
+  const path = require('path').join(__dirname, BUNDLED.file);
+  if (!require('fs').existsSync(path)) return;
+  const data = require('fs').readFileSync(path);
+  const sha256 = crypto.createHash('sha256').update(data).digest('hex');
+  const have = await pool.query('SELECT 1 FROM app_builds WHERE sha256 = $1', [sha256]);
+  if (have.rows.length) return;
+  await pool.query('INSERT INTO app_builds (version_code, version_name, notes, sha256, size, data) VALUES ($1, $2, $3, $4, $5, $6)',
+    [BUNDLED.code, BUNDLED.name, BUNDLED.notes, sha256, data.length, data]);
+  await pool.query('DELETE FROM app_builds WHERE id NOT IN (SELECT id FROM app_builds ORDER BY id DESC LIMIT 2)');
+  console.log(`updates: загружена сборка ${BUNDLED.name} (${BUNDLED.code}) из ${BUNDLED.file}`);
 }
 
 async function refresh(pool) {
