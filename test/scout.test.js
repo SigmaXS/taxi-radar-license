@@ -66,3 +66,18 @@ test('majority value across tariffs; ties take the larger', () => {
   assert.equal(register.single({ econom: 15, comfort: 35, comfortplus: null }), 35);
   assert.equal(register.single({ econom: null, comfort: null, comfortplus: null }), null);
 });
+
+test('point B is checked after driver points and at most every 2.5 minutes', async () => {
+  const f = fixture();
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85, b_lat: 47.05, b_lon: 28.80 });
+  const t1 = await f.call('/api/scout/tasks', {}, 'scout-1');
+  assert.equal(t1.points.length, 2);
+  assert.ok(Math.abs(t1.points[0].lat - 47.0) < 1e-9, 'driver point first');
+  await f.call('/api/scout/result', { lat: 47.05, lon: 28.80, values: { econom: 35, comfort: 35, comfortplus: 35 } }, 'scout-1');
+  await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
+  const r = await f.call('/api/scout/near', { lat: 47.0, lon: 28.85, b_lat: 47.05, b_lon: 28.80 });
+  assert.equal(r.surge, 15); assert.equal(r.surge_b, 35);
+  f.tick(90e3);
+  const t2 = await f.call('/api/scout/tasks', {}, 'scout-1');
+  assert.equal(t2.points.length, 1, 'after 90 s only the driver point is due');
+});

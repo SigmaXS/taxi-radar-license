@@ -10,6 +10,8 @@ const WANT_MS = 3 * 60e3;      // точка в очереди, пока вод�
 const FRESH_MS = 5 * 60e3;     // результат годен 5 мин
 const NEAR_KM = 0.3;           // результат соседней клетки годится, если ближе 300 м
 const LEASE_MS = 60e3;         // выданную разведчику точку минуту не отдаём другому
+const RECHECK_MS = 60e3;       // точку водителя — не чаще раза в минуту
+const RECHECK_B_MS = 150e3;    // точку Б (куда везёт) — раз в 2,5 мин и только после точек водителей
 
 function km(a, b) {
   const R = 6371, rad = x => x * Math.PI / 180;
@@ -58,18 +60,31 @@ module.exports = function registerScout(app, { member }, options = {}) {
     return best?.r || null;
   }
 
-  // Радар водителя, раз в минуту: «я здесь» → надбавка разведчика рядом (или null — ещё не проверено).
-  app.post('/api/scout/near', member(async (req, res) => {
-    const { lat, lon } = req.body;
-    if (!okCoord(lat, lon)) return res.status(400).json({ ok: false, code: 'bad_point' });
-    if (km(CENTER, { lat, lon }) > radiusKm()) return res.json({ ok: true, surge: 0, far: true });
-    prune();
+  function want(lat, lon, b) {
     const key = cellOf(lat, lon);
-    const w = wanted.get(key) || { at: 0, lease: 0 };
-    w.at = now(); wanted.set(key, w);
-    const r = nearest({ lat, lon });
-    if (!r) return res.json({ ok: true, surge: null, scouting: scouts().length > 0 });
-    res.json({ ok: true, surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
+    const w = wanted.get(key) || { at: 0, lease: 0, b: true };
+    w.at = now(); w.b = w.b && b; // точка, где стоит хоть один водитель, важнее точки Б
+    wanted.set(key, w);
+  }
+
+  // Радар водителя, раз в минуту: «я здесь» (и куда везу — b_lat/b_lon) → надбавка разведчика рядом.
+  app.post('/api/scout/near', member(async (req, res) => {
+    const { lat, lon, b_lat, b_lon } = req.body;
+    if (!okCoord(lat, lon)) return res.status(400).json({ ok: false, code: 'bad_point' });
+    prune();
+    const out = { ok: true };
+    if (km(CENTER, { lat, lon }) > radiusKm()) { out.surge = 0; out.far = true; }
+    else {
+      want(lat, lon, false);
+      const r = nearest({ lat, lon });
+      if (r) Object.assign(out, { surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
+      else Object.assign(out, { surge: null, scouting: scouts().length > 0 });
+    }
+    if (okCoord(b_lat, b_lon)) {
+      if (km(CENTER, { lat: b_lat, lon: b_lon }) > radiusKm()) out.surge_b = 0;
+      else { want(b_lat, b_lon, true); const rb = nearest({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
+    }
+    res.json(out);
   }));
 
   // Разведчик: дай точки для проверки — где водители, сначала давно не проверенные.
@@ -81,8 +96,9 @@ module.exports = function registerScout(app, { member }, options = {}) {
     const list = [...wanted.entries()]
       .filter(([, w]) => w.lease < t)
       .map(([k, w]) => ({ k, w, checked: results.get(k)?.at || 0 }))
-      .filter(x => t - x.checked > 60e3)            // эту клетку проверяли меньше минуты назад
-      .sort((a, b) => a.checked - b.checked)
+      // Точки водителей — раз в минуту; точки Б — раз в 2,5 мин и в конце очереди.
+      .filter(x => t - x.checked > (x.w.b ? RECHECK_B_MS : RECHECK_MS))
+      .sort((a, b) => (a.w.b - b.w.b) || (a.checked - b.checked))
       .slice(0, limit);
     list.forEach(x => { x.w.lease = t + LEASE_MS; });
     res.json({ ok: true, points: list.map(x => ({ ...centerOf(x.k) })) });
