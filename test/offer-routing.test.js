@@ -8,7 +8,11 @@ const geocoder = { lookupRoute: async q => q.startsWith('Zelinski') ? { source: 
 function reply(url, n) {
   const pickup = n % 2 === 1;
   const m = pickup ? 1600 : 12200, s = pickup ? 300 : 2160;
-  if (url.includes('tomtom')) return { routes: [{ summary: { lengthInMeters: m, travelTimeInSeconds: s }, legs: [{ points: [{ latitude: 47, longitude: 28.8 }, { latitude: 47.01, longitude: 28.81 }] }] }] };
+  const pts = [{ latitude: 47, longitude: 28.8 }, { latitude: 47.01, longitude: 28.81 }];
+  // «водитель → А → Б» одним запросом: две части маршрута.
+  if (url.includes('tomtom') && (url.split('calculateRoute/')[1] || '').split('/json')[0].split(':').length === 3) return { routes: [{ legs: [
+    { summary: { lengthInMeters: 1600, travelTimeInSeconds: 300 }, points: pts }, { summary: { lengthInMeters: 12200, travelTimeInSeconds: 2160 }, points: pts }] }] };
+  if (url.includes('tomtom')) return { routes: [{ summary: { lengthInMeters: m, travelTimeInSeconds: s }, legs: [{ points: pts }] }] };
   if (url.includes('hereapi')) return { routes: [{ sections: [{ summary: { length: m, duration: s }, polyline: 'BFoz5xJ67i1B1B7PzIhaxL7Y' }] }] };
   if (url.includes('mapbox')) return { routes: [{ distance: m, duration: s, geometry: '_p~iF~ps|U_ulLnnqC' }] };
   return { routes: [{ distanceMeters: m, duration: `${s}s`, polyline: { encodedPolyline: '_p~iF~ps|U_ulLnnqC' } }] };
@@ -44,8 +48,8 @@ test('first configured provider in order answers; legs keep pickup and trip sepa
   assert.equal(r.status, 200);
   assert.equal(r.result.provider, 'tomtom');
   assert.equal(r.result.pickup.minutes, 5); assert.equal(r.result.trip.minutes, 36); assert.equal(r.result.trip.km, 12.2);
-  assert.equal(f.calls.length, 2);
-  assert.ok(f.calls[0].url.includes('47.01,28.86:46.99,28.85'));
+  assert.equal(f.calls.length, 1); // подача и поездка одним запросом
+  assert.ok(f.calls[0].url.includes('47.01,28.86:46.99,28.85:'));
 });
 
 test('provider limit reply moves to the next one and is remembered', async () => {
@@ -133,15 +137,16 @@ test('Yandex rejects Bucovinei in Stauceni and city-only centroids', () => {
   assert.equal(match('Bucovinei 5, Chișinău', {...house('Кишинёв'), precision: 'near'}), false);
 });
 
-test('TomTom departure timestamps retain UTC zone and pickup delay', async () => {
+test('TomTom: one request driver → A → B, departure in UTC; the trip leg is timed by TomTom after pickup', async () => {
   const f = fixture({ env: { TOMTOM_API_KEY: 'test' } });
-  assert.equal((await f.call()).status, 200);
+  const r = await f.call();
+  assert.equal(r.status, 200);
+  assert.equal(f.calls.length, 1);
   const start = new URL(f.calls[0].url).searchParams;
-  const next = new URL(f.calls[1].url).searchParams;
   assert.equal(start.get('traffic'), 'true');
   assert.match(start.get('departAt'), /Z$/);
   assert.equal(Date.parse(start.get('departAt')), 1800000002000);
-  assert.equal(Date.parse(next.get('departAt')) - Date.parse(start.get('departAt')), 7 * 60000);
+  assert.equal(r.result.pickup.minutes, 5); assert.equal(r.result.trip.minutes, 36);
 });
 
 test('village street unknown to search: the village centre is used if it fits the card km', async () => {

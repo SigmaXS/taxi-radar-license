@@ -90,6 +90,19 @@ const PROVIDERS = {
       if (!route) throw new Error('route_not_found');
       const pts = (route.legs || []).flatMap(l => (l.points || []).map(p => [p.latitude, p.longitude]));
       return leg(route.summary?.lengthInMeters, route.summary?.travelTimeInSeconds, pts.length ? encodePolyline(pts) : '');
+    },
+    // Подача и поездка одним запросом «водитель → А → Б»: вдвое меньше запросов и ожидания.
+    async via(fetch, key, from, a, b, departure) {
+      const url = `https://api.tomtom.com/routing/1/calculateRoute/${from.lat},${from.lon}:${a.lat},${a.lon}:${b.lat},${b.lon}/json?` +
+        new URLSearchParams({ key, traffic: 'true', travelMode: 'car', routeType: 'fastest', departAt: new Date(departure).toISOString() });
+      const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (r.status === 429 || r.status === 403) throw new LimitError();
+      if (!r.ok) throw new Error('route_provider_error');
+      const legs = (await r.json()).routes?.[0]?.legs;
+      if (!legs || legs.length < 2) throw new Error('route_not_found');
+      const part = l => leg(l.summary?.lengthInMeters, l.summary?.travelTimeInSeconds,
+        (l.points || []).length ? encodePolyline(l.points.map(p => [p.latitude, p.longitude])) : '');
+      return { pickup: part(legs[0]), trip: part(legs[1]) };
     }
   },
   here: {
@@ -201,21 +214,34 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
     } catch { return []; }
   }
 
+  // Найденные адреса запоминаем на сутки: одни и те же улицы приходят постоянно, а пока заказ «звенит», каждая секунда на счету.
+  const found = new Map();
   async function candidates(text, near) {
-    // Сначала геокодер Яндекса (точный ответ); затем варианты TomTom — пара, сходящаяся с км карточки, решит.
-    const found = [];
-    if (geocoder?.lookupRoute) for (const q of variants(text).slice(0, 3)) {
-      const r = await geocoder.lookupRoute(q).catch(() => null);
-      if (r?.found && r.source === 'yandex' && !r.approx && Number.isFinite(r.lat) && Number.isFinite(r.lon)) {
-        found.push({ lat: r.lat, lon: r.lon }); break;
-      }
-    }
-    if (near) for (const q of variants(text).slice(0, 2)) found.push(...await tomtomSearch(q, near));
+    const key = text.trim().toLowerCase();
+    const hit = found.get(key);
+    if (hit && now() - hit.at < 24 * 3600e3 && hit.list.length) return hit.list;
+    const v = variants(text);
     // Улицы в селе нет ни у кого («Hasdeu 5, Peresecina») — центр самого села: для дальней поездки точности хватает.
     const parts = text.split(',').map(s => s.trim()).filter(Boolean);
     const place = parts.length > 1 ? parts[parts.length - 1].replace(/\d{4}/g, '').trim() : '';
-    if (near && place.length >= 4 && !/\d/.test(place) && !/chi[șs]in[ăa]u|кишин/iu.test(place)) found.push(...await tomtomSearch(place, near));
-    return found;
+    const village = near && place.length >= 4 && !/\d/.test(place) && !/chi[șs]in[ăa]u|кишин/iu.test(place);
+    // Все запросы разом, а не по очереди: Яндекс (точный ответ) и варианты TomTom; пара, сходящаяся с км карточки, решит.
+    const [yandex, ...tomtom] = await Promise.all([
+      (async () => {
+        if (!geocoder?.lookupRoute) return [];
+        const rs = await Promise.all(v.slice(0, 3).map(q => geocoder.lookupRoute(q).catch(() => null)));
+        const r = rs.find(x => x?.found && x.source === 'yandex' && !x.approx && Number.isFinite(x.lat) && Number.isFinite(x.lon));
+        return r ? [{ lat: r.lat, lon: r.lon }] : [];
+      })(),
+      ...(near ? v.slice(0, 2).map(q => tomtomSearch(q, near)) : []),
+      ...(village ? [tomtomSearch(place, near)] : [])
+    ]);
+    const list = [...yandex, ...tomtom.flat()];
+    if (list.length) {
+      if (found.size > 3000) found.clear();
+      found.set(key, { at: now(), list });
+    }
+    return list;
   }
 
   const straightKm = (p, q) => {
@@ -285,6 +311,11 @@ module.exports = function registerOfferRouting(app, { member, tooOften, geocoder
           const trip = await p.route(fetchRoute, keyOf(name), A, B, departure);
           count(name, 1);
           return res.json({ ok: true, provider: name, calculated_at: now(), pickup: null, trip, points: { a: A.lat != null ? A : null, b: B.lat != null ? B : null } });
+        }
+        if (p.via) {
+          const both = await p.via(fetchRoute, keyOf(name), from, A, B, departure);
+          count(name, 1);
+          return res.json({ ok: true, provider: name, calculated_at: now(), pickup: both.pickup, trip: both.trip });
         }
         const pickup = await p.route(fetchRoute, keyOf(name), from, A, departure);
         // Пассажир садится после подачи и посадки — поездку считаем с этого времени.
