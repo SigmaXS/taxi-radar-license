@@ -10,7 +10,9 @@ const WANT_MS = 3 * 60e3;      // точка в очереди, пока вод�
 const FRESH_MS = 5 * 60e3;     // результат годен 5 мин
 const NEAR_KM = 0.3;           // результат соседней клетки годится, если ближе 300 м
 const LEASE_MS = 60e3;         // выданную разведчику точку минуту не отдаём другому
-const RECHECK_MS = 60e3;       // точку водителя — не чаще раза в минуту
+const RECHECK_MS = 60e3;       // точку водителя — не чаще раза в минуту…
+const RECHECK_FEW_MS = 20e3;   // …а пока точек водителей мало (до FEW) — раз в 20 с: разведчик всё равно свободен
+const FEW = 5;
 const RECHECK_B_MS = 150e3;    // точку Б (куда везёт) — раз в 2,5 мин и только после точек водителей
 
 function km(a, b) {
@@ -34,7 +36,7 @@ function single(values) {
   return [...count.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0];
 }
 
-module.exports = function registerScout(app, { member }, options = {}) {
+module.exports = function registerScout(app, { member, escapeHtml = s => String(s) }, options = {}) {
   const now = options.now || Date.now;
   const env = options.env || process.env;
   const radiusKm = () => { const n = parseFloat(env.SCOUT_RADIUS_KM); return Number.isFinite(n) && n > 0 ? n : 20; };
@@ -93,14 +95,16 @@ module.exports = function registerScout(app, { member }, options = {}) {
     prune();
     const t = now();
     const limit = Math.min(Math.max(parseInt(req.body.limit, 10) || 8, 1), 20);
+    const drivers = [...wanted.values()].filter(w => !w.b).length;
+    const recheck = drivers <= FEW ? RECHECK_FEW_MS : RECHECK_MS;
     const list = [...wanted.entries()]
       .filter(([, w]) => w.lease < t)
       .map(([k, w]) => ({ k, w, checked: results.get(k)?.at || 0 }))
       // Точки водителей — раз в минуту; точки Б — раз в 2,5 мин и в конце очереди.
-      .filter(x => t - x.checked > (x.w.b ? RECHECK_B_MS : RECHECK_MS))
+      .filter(x => t - x.checked > (x.w.b ? RECHECK_B_MS : recheck))
       .sort((a, b) => (a.w.b - b.w.b) || (a.checked - b.checked))
       .slice(0, limit);
-    list.forEach(x => { x.w.lease = t + LEASE_MS; });
+    list.forEach(x => { x.w.lease = t + Math.min(LEASE_MS, recheck); });
     res.json({ ok: true, points: list.map(x => ({ ...centerOf(x.k) })) });
   }));
 
@@ -122,6 +126,29 @@ module.exports = function registerScout(app, { member }, options = {}) {
     }
     res.json({ ok: true, value });
   }));
+
+  // Админка: очередь разведчика — какие точки, когда водитель там был и когда проверено (страница обновляется сама).
+  app.get('/admin/scout', (req, res) => {
+    prune();
+    const t = now();
+    const age = ms => ms == null ? '—' : ms < 120e3 ? `${Math.round(ms / 1000)} с` : `${Math.round(ms / 60e3)} мин`;
+    const rows = [...wanted.entries()].map(([k, w]) => ({ k, w, p: centerOf(k), r: results.get(k) }))
+      .sort((a, b) => (a.w.b - b.w.b) || (b.w.at - a.w.at))
+      .map(({ w, p, r }) => `<tr><td>${w.b ? 'Б (куда везут)' : 'водитель'}</td>
+        <td><a href="https://yandex.md/maps/?pt=${p.lon},${p.lat}&z=16" target="_blank">${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}</a></td>
+        <td>${age(t - w.at)} назад</td><td>${r ? age(t - r.at) + ' назад' : 'ещё нет'}</td>
+        <td><b>${r ? (r.value == null ? 'нет машин' : '+' + r.value) : ''}</b></td>
+        <td style="font-size:12px;color:#4a5568;">${r ? escapeHtml(JSON.stringify(r.values)) : ''}</td></tr>`).join('');
+    const nav = (() => { try { return require('./admin_nav').adminNav('/admin/scout'); } catch { return ''; } })();
+    res.send(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta http-equiv="refresh" content="10"><title>Разведчик — Taxi Radar</title>
+      <style>body{font-family:sans-serif;background:#f0f2f5;padding:25px;margin:0}.card{background:#fff;border-radius:10px;padding:20px;max-width:1150px;margin:0 auto;box-shadow:0 4px 12px rgba(0,0,0,.06)}
+      table{width:100%;border-collapse:collapse;font-size:15px}td,th{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}th{background:#ebf4ff}</style></head><body>${nav}
+      <div class="card"><h2>🛰 Разведчик надбавки</h2>
+      <p>Телефонов-разведчиков: <b>${scouts().length}</b> · точек в очереди: <b>${wanted.size}</b> ·
+      точку водителя проверяем раз в <b>${[...wanted.values()].filter(w => !w.b).length <= FEW ? '20 с' : 'минуту'}</b>, точку Б — раз в 2,5 мин.
+      Точка пропадает, если радар водителя молчит 3 минуты. Страница обновляется каждые 10 с.</p>
+      <table><tr><th>Чья</th><th>Где</th><th>Водитель был</th><th>Проверено</th><th>Надбавка</th><th>По тарифам</th></tr>${rows || '<tr><td colspan="6">Очередь пустая — ни у кого из водителей с 2.3 радар сейчас не запущен.</td></tr>'}</table></div></body></html>`);
+  });
 
   /** Для админки и проверки: сколько точек ждут и сколько свежих результатов. */
   return () => {

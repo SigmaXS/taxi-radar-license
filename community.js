@@ -723,7 +723,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   const geocoder = require('./geocoder')(pool);
   app.locals.routeStats = require('./offer-routing')(app, { member, tooOften, geocoder, pool });
   // Разведчик надбавки (Яндекс Go на отдельном телефоне), см. scout.js.
-  app.locals.scoutStats = require('./scout')(app, { member });
+  app.locals.scoutStats = require('./scout')(app, { member, escapeHtml });
 
   // События (концерты, матчи): /admin/events и /api/events/list.
   require('./events')(app, pool, { member, escapeHtml, geocoder });

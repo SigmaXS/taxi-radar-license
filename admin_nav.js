@@ -7,6 +7,7 @@ const TABS = [
   ['/admin/events', '🎫 События'],
   ['/admin/messages', '📣 Сообщения'],
   ['/admin/weekly', '📊 Сводка'],
+  ['/admin/scout', '🛰 Разведчик'],
   ['/admin/crashes', '🐞 Ошибки'],
   ['/admin/apk', '⬆️ Обновление']
 ];

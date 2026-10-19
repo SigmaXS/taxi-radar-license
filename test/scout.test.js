@@ -5,7 +5,7 @@ const register = require('../scout');
 function fixture(env = { SCOUT_DEVICE_IDS: 'scout-1' }) {
   const routes = {};
   let t = 1800000000000;
-  const stats = register({ post: (path, fn) => { routes[path] = fn; } }, {
+  const stats = register({ post: (path, fn) => { routes[path] = fn; }, get: (path, fn) => { routes['GET ' + path] = fn; } }, {
     member: fn => (req, res) => fn(req, res, req.device)
   }, { env, now: () => t });
   const call = async (path, body, device = 'driver-1') => {
@@ -80,4 +80,19 @@ test('point B is checked after driver points and at most every 2.5 minutes', asy
   f.tick(90e3);
   const t2 = await f.call('/api/scout/tasks', {}, 'scout-1');
   assert.equal(t2.points.length, 1, 'after 90 s only the driver point is due');
+});
+
+test('few driver points are rechecked every 20 s, many every minute', async () => {
+  const f = fixture();
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 });
+  await f.call('/api/scout/tasks', {}, 'scout-1');
+  await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
+  f.tick(25e3);
+  assert.equal((await f.call('/api/scout/tasks', {}, 'scout-1')).points.length, 1, 'one driver: due again after 20 s');
+  for (let i = 0; i < 6; i++) await f.call('/api/scout/near', { lat: 47.01 + i * 0.01, lon: 28.85 });
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 });
+  await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
+  f.tick(25e3);
+  const t = await f.call('/api/scout/tasks', {}, 'scout-1');
+  assert.ok(!t.points.some(p => Math.abs(p.lat - 47.0) < 1e-9), 'seven drivers: not due after 25 s');
 });
