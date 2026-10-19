@@ -9,6 +9,9 @@ const CELL = 0.001;            // ~110 × 75 м: точки водителей �
 const WANT_MS = 3 * 60e3;      // точка в очереди, пока водитель в ней был последние 3 мин
 const FRESH_MS = 5 * 60e3;     // результат годен 5 мин
 const NEAR_KM = 0.3;           // результат соседней клетки годится, если ближе 300 м
+// Новое место водителя ещё не проверено (едет) — до проверки отдаём ближайшую свежую проверку поблизости, а не «?»:
+// надбавка меняется зонами в несколько кварталов.
+const FALLBACK_KM = 1.2, FALLBACK_MS = 3 * 60e3;
 const LEASE_MS = 60e3;         // выданную разведчику точку минуту не отдаём другому
 const RECHECK_MS = 60e3;       // точку водителя — не чаще раза в минуту…
 const RECHECK_FEW_MS = 20e3;   // …а пока точек водителей мало (до FEW) — раз в 20 с: разведчик всё равно свободен
@@ -53,16 +56,17 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     for (const [k, r] of results) if (t - r.at > FRESH_MS * 3) results.delete(k);
   }
 
-  function nearest(p) {
+  function nearest(p, radius = NEAR_KM, maxAge = FRESH_MS) {
     const t = now();
     let best = null;
     for (const r of results.values()) {
-      if (t - r.at > FRESH_MS || r.value === null) continue;
+      if (t - r.at > maxAge || r.value === null) continue;
       const d = km(p, r);
-      if (d <= NEAR_KM && (!best || d < best.d)) best = { d, r };
+      if (d <= radius && (!best || d < best.d)) best = { d, r };
     }
     return best?.r || null;
   }
+  const nearestOrAround = p => nearest(p) || nearest(p, FALLBACK_KM, FALLBACK_MS);
 
   // Чья точка: водитель уехал — его старая клетка сразу уходит из очереди (если там больше никого),
   // а не висит ещё 3 минуты. Так же с точкой Б: новая заменяет старую, нет Б — заказ кончился.
@@ -100,13 +104,13 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     if (km(CENTER, { lat, lon }) > radiusKm()) { out.surge = 0; out.far = true; forget(deviceId, false); }
     else {
       want(lat, lon, false, deviceId);
-      const r = nearest({ lat, lon });
+      const r = nearestOrAround({ lat, lon });
       if (r) Object.assign(out, { surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
       else Object.assign(out, { surge: null, scouting: scouts().length > 0 });
     }
     if (okCoord(b_lat, b_lon)) {
       if (km(CENTER, { lat: b_lat, lon: b_lon }) > radiusKm()) out.surge_b = 0;
-      else { want(b_lat, b_lon, true, deviceId); const rb = nearest({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
+      else { want(b_lat, b_lon, true, deviceId); const rb = nearestOrAround({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
     } else forget(deviceId, true);
     res.json(out);
   }));

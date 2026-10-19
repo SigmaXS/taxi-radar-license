@@ -111,3 +111,15 @@ test('a driver who moved: the old point leaves the queue at once', async () => {
   t = await f.call('/api/scout/tasks', {}, 'scout-1');
   assert.ok(!t.points.some(p => Math.abs(p.lat - 47.0) < 1e-9), 'nobody at the old point any more');
 });
+
+test('driver on the move: a fresh check within 1.2 km is used until the new point is checked', async () => {
+  const f = fixture();
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 });
+  await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
+  const moved = await f.call('/api/scout/near', { lat: 47.008, lon: 28.85 }); // ~0.9 км
+  assert.equal(moved.surge, 15);
+  const far = await f.call('/api/scout/near', { lat: 47.03, lon: 28.85 }, 'driver-9'); // ~3.3 км
+  assert.equal(far.surge, null);
+  f.tick(4 * 60e3);
+  assert.equal((await f.call('/api/scout/near', { lat: 47.008, lon: 28.85 }, 'driver-8')).surge, null, 'too old for the fallback');
+});
