@@ -2,12 +2,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const register = require('../scout');
 
-function fixture(env = { SCOUT_DEVICE_IDS: 'scout-1' }) {
+function fixture(env = { SCOUT_DEVICE_IDS: 'scout-1' }, sent = []) {
   const routes = {};
   let t = 1800000000000;
   const stats = register({ post: (path, fn) => { routes[path] = fn; }, get: (path, fn) => { routes['GET ' + path] = fn; } }, {
     member: fn => (req, res) => fn(req, res, req.device)
-  }, { env, now: () => t });
+  }, { env, now: () => t, telegram: text => sent.push(text) });
   const call = async (path, body, device = 'driver-1') => {
     let status = 200, result;
     const res = { status(v) { status = v; return this; }, json(v) { result = v; return this; } };
@@ -128,4 +128,22 @@ test("scout phones' own location is not queued", async () => {
   const f = fixture();
   await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }, 'scout-1');
   assert.equal((await f.call('/api/scout/tasks', {}, 'scout-1')).points.length, 0);
+});
+
+
+test('watchdog: silent, stuck, broken accessibility and recovery each message once', async () => {
+  const sent = [];
+  const f = fixture({ SCOUT_DEVICE_IDS: 'scout-1' }, sent);
+  f.tick(6 * 60e3); f.stats.watch();
+  assert.equal(sent.length, 1); assert.match(sent[0], /не на связи/);
+  f.stats.watch(); assert.equal(sent.length, 1); // не повторять
+  await f.call('/api/scout/status', { a11y: false }, 'scout-1'); f.stats.watch();
+  assert.match(sent[1], /спец\. возможность/);
+  await f.call('/api/scout/status', { a11y: true }, 'scout-1'); f.stats.watch();
+  assert.match(sent[2], /снова работает/);
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 });
+  for (let i = 0; i < 6; i++) { f.tick(60e3); await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }); await f.call('/api/scout/tasks', {}, 'scout-1'); }
+  f.stats.watch(); assert.match(sent[3], /завис/);
+  await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
+  f.stats.watch(); assert.match(sent[4], /снова работает/); assert.equal(sent.length, 5);
 });

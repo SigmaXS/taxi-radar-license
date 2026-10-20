@@ -129,9 +129,52 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     res.json(out);
   }));
 
+  // ---------- сторож: разведчик замолчал или завис — сообщение владельцу в Telegram ----------
+  const health = new Map(); // scout → { task: последний запрос точек, result: последняя проверка, a11y, state }
+  const startedAt = now();
+  const hp = id => health.get(id) || (health.set(id, { task: 0, result: 0, a11y: true, state: 'ok' }), health.get(id));
+  async function telegram(text) {
+    const token = env.TELEGRAM_BOT_TOKEN, chat = env.TELEGRAM_ADMIN_CHAT_ID;
+    if (options.telegram) return options.telegram(text);
+    if (!token || !chat) return;
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chat, text }), signal: AbortSignal.timeout(10000) }).catch(() => null);
+  }
+  function watch() {
+    const t = now();
+    if (t - startedAt < 5 * 60e3) return; // после перезапуска сервера — дать разведчикам выйти на связь
+    const waiting = [...wanted.values()].some(w => !w.b);
+    for (const id of scouts()) {
+      const h = hp(id);
+      const state = t - h.task > 5 * 60e3 ? 'silent'
+        : !h.a11y ? 'a11y'
+        : waiting && t - Math.max(h.result, startedAt) > 5 * 60e3 ? 'stuck' : 'ok';
+      if (state === h.state) continue;
+      const name = `разведчик …${id.slice(-4)}`;
+      const text = {
+        silent: `🛰 ${name} не на связи 5 мин: радар выключен, нет интернета или телефон сел. Проверьте телефон.`,
+        a11y: `🛰 ${name}: спец. возможность Taxi Radar включена, но не работает. Выключите и включите её снова или перезагрузите телефон.`,
+        stuck: `🛰 ${name} 5 мин не прислал ни одной проверки, хотя водители ждут: Яндекс Go завис или экран заблокирован. Перезагрузите телефон.`,
+        ok: `✅ ${name} снова работает.`
+      }[state];
+      h.state = state;
+      console.log('scout:', text);
+      telegram(text);
+    }
+  }
+  if (!options.now) setInterval(watch, 60e3).unref();
+
+  // Разведчик сообщает о себе (спец. возможность работает?) — раз в круг.
+  app.post('/api/scout/status', member(async (req, res, deviceId) => {
+    if (!scouts().includes(deviceId)) return res.status(403).json({ ok: false, code: 'not_scout' });
+    const h = hp(deviceId); h.task = now(); h.a11y = req.body.a11y !== false;
+    res.json({ ok: true });
+  }));
+
   // Разведчик: дай точки для проверки — где водители, сначала давно не проверенные.
   app.post('/api/scout/tasks', member(async (req, res, deviceId) => {
     if (!scouts().includes(deviceId)) return res.status(403).json({ ok: false, code: 'not_scout' });
+    hp(deviceId).task = now();
     prune();
     const t = now();
     const limit = Math.min(Math.max(parseInt(req.body.limit, 10) || 8, 1), 20);
@@ -159,6 +202,7 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     const key = cellOf(lat, lon);
     // Ни по одному тарифу нет машин — «нет данных», а не 0; клетка снова встанет в очередь через минуту.
     store(key, { at: now(), value, values, lat, lon });
+    hp(deviceId).result = now();
     const w = wanted.get(key); if (w) w.lease = 0;
     const spread = Object.values(values).filter(Number.isInteger);
     if (spread.length > 1 && Math.max(...spread) !== Math.min(...spread)) {
@@ -204,14 +248,14 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
   });
 
   /** Для админки и проверки: сколько точек ждут и сколько свежих результатов. */
-  return () => {
+  return Object.assign(() => {
     prune();
     const t = now();
     const fresh = [...results.values()].filter(r => t - r.at <= FRESH_MS);
     const last = Math.max(0, ...[...results.values()].map(r => r.at));
     return { scouts: scouts().length, wanted: wanted.size, fresh: fresh.length,
       hot: fresh.filter(r => r.value > 0).length, lastAgeSec: last ? Math.round((t - last) / 1000) : null };
-  };
+  }, { watch });
 };
 
 module.exports.single = single;
