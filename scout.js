@@ -116,15 +116,16 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     const out = { ok: true };
     if (km(CENTER, { lat, lon }) > radiusKm()) { out.surge = 0; out.far = true; forget(deviceId, false); }
     else {
-      // Телефоны-разведчики лежат дома с Яндекс Go — их собственное место проверять незачем.
-      if (!scouts().includes(deviceId)) want(lat, lon, false, deviceId);
+      // Разведчик за работой лежит дома с Яндекс Go — его место проверять незачем. Телефон из списка,
+      // который сейчас не разведывает (водитель взял его в машину), — обычный водитель.
+      if (!scouting(deviceId)) want(lat, lon, false, deviceId);
       const r = nearestOrAround({ lat, lon });
       if (r) Object.assign(out, { surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
       else Object.assign(out, { surge: null, scouting: scouts().length > 0 });
     }
     if (okCoord(b_lat, b_lon)) {
       if (km(CENTER, { lat: b_lat, lon: b_lon }) > radiusKm()) out.surge_b = 0;
-      else { if (!scouts().includes(deviceId)) want(b_lat, b_lon, true, deviceId); const rb = nearestOrAround({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
+      else { if (!scouting(deviceId)) want(b_lat, b_lon, true, deviceId); const rb = nearestOrAround({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
     } else forget(deviceId, true);
     res.json(out);
   }));
@@ -132,6 +133,7 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
   // ---------- сторож: разведчик замолчал или завис — сообщение владельцу в Telegram ----------
   const health = new Map(); // scout → { task: последний запрос точек, result: последняя проверка, a11y, state }
   const startedAt = now();
+  const scouting = id => scouts().includes(id) && now() - hp(id).task < 2 * 60e3;
   const hp = id => health.get(id) || (health.set(id, { task: 0, result: 0, a11y: true, state: 'ok' }), health.get(id));
   async function telegram(text) {
     const token = env.TELEGRAM_BOT_TOKEN, chat = env.TELEGRAM_ADMIN_CHAT_ID;

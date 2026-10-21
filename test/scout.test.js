@@ -126,6 +126,7 @@ test('driver on the move: a fresh check within 1.2 km is used until the new poin
 
 test("scout phones' own location is not queued", async () => {
   const f = fixture();
+  await f.call('/api/scout/tasks', {}, 'scout-1'); // разведчик за работой
   await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }, 'scout-1');
   assert.equal((await f.call('/api/scout/tasks', {}, 'scout-1')).points.length, 0);
 });
@@ -146,4 +147,13 @@ test('watchdog: silent, stuck, broken accessibility and recovery each message on
   f.stats.watch(); assert.match(sent[3], /завис/);
   await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
   f.stats.watch(); assert.match(sent[4], /снова работает/); assert.equal(sent.length, 5);
+});
+
+test('a listed scout phone that is not scouting is queued like a driver', async () => {
+  const f = fixture();
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }, 'scout-1');
+  assert.equal((await f.call('/api/scout/tasks', {}, 'scout-1')).points.length, 1);
+  f.tick(30e3);
+  await f.call('/api/scout/near', { lat: 47.01, lon: 28.86 }, 'scout-1'); // разведывает — своё место не ставим
+  assert.equal((await f.call('/api/scout/queue', {}, 'scout-1')).points.length, 1);
 });
