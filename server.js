@@ -75,7 +75,7 @@ async function initDB() {
 // Разовые правки данных: каждая выполняется ровно один раз (отметка в one_time_jobs), перезапуски не повторяют.
 async function oneTimeJobs() {
   await pool.query('CREATE TABLE IF NOT EXISTS one_time_jobs (name VARCHAR(100) PRIMARY KEY, done_at TIMESTAMP NOT NULL DEFAULT NOW(), info TEXT)');
-  // 2026-10-22: надбавка Яндекса не работала — +3 дня всем, у кого срок истёк, и всем на 2.3 / 2.3.1
+  // 2026-10-22: надбавка Яндекса не работала — +3 дня всем, у кого срок истёк, и всем на 2.2 / 2.3 / 2.3.1
   // (истёкшим — от сегодня, у кого срок идёт — к сроку).
   const client = await pool.connect();
   try {
@@ -88,9 +88,15 @@ async function oneTimeJobs() {
       const r = await client.query(
         `UPDATE devices SET expires = GREATEST(expires, NOW()) + INTERVAL '3 days'
           WHERE COALESCE(status, '') NOT IN ('banned', 'disabled') AND NOT (device_id = ANY($1))
-            AND (expires < NOW() OR device_info ~ 'v2[.]3([.]|$)') RETURNING device_id`, [skip]);
+            AND (expires < NOW() OR device_info ~ 'v2[.][23]([.]|$)') RETURNING device_id`, [skip]);
       await client.query("UPDATE one_time_jobs SET info = $1 WHERE name = '2026-10-22 +3 days expired or 2.3'", [r.rows.map(x => x.device_id).join(',')]);
-      console.log(`Разовая правка: +3 дня истёкшим и всем на 2.3 — ${r.rows.length} устройств`);
+      // Баннер на главной приложения — в ту же минуту, что и дни; висит 3 дня.
+      await client.query(
+        `INSERT INTO announcements (text, until) VALUES ($1, NOW() + INTERVAL '3 days')`,
+        ['🎁 +3 дня в подарок! Несколько дней надбавка Яндекса работала с перебоями — Яндекс изменил свой сервис. ' +
+         'Мы всё починили, а вам добавили 3 дня подписки. Извините за неудобства! · ' +
+         '🎁 +3 zile cadou! Câteva zile adaosul Yandex a funcționat cu întreruperi. Am reparat totul și v-am adăugat 3 zile. Ne cerem scuze!']);
+      console.log(`Разовая правка: +3 дня истёкшим и всем на 2.2/2.3 — ${r.rows.length} устройств`);
     }
     await client.query('COMMIT');
   } catch (e) {
