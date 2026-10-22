@@ -82,10 +82,13 @@ async function oneTimeJobs() {
     await client.query('BEGIN');
     const job = await client.query("INSERT INTO one_time_jobs (name) VALUES ('2026-10-22 +3 days expired or 2.3') ON CONFLICT DO NOTHING RETURNING name");
     if (job.rows.length) {
+      // Если успела выкатиться прошлая версия этой правки (только истёкшие на 2.3) — им второй раз не даём.
+      const early = (await client.query("SELECT info FROM one_time_jobs WHERE name = '2026-10-22 +3 days expired 2.3'")).rows[0];
+      const skip = early && early.info ? early.info.split(',') : [];
       const r = await client.query(
         `UPDATE devices SET expires = GREATEST(expires, NOW()) + INTERVAL '3 days'
-          WHERE COALESCE(status, '') NOT IN ('banned', 'disabled')
-            AND (expires < NOW() OR device_info ~ 'v2[.]3([.]|$)') RETURNING device_id`);
+          WHERE COALESCE(status, '') NOT IN ('banned', 'disabled') AND NOT (device_id = ANY($1))
+            AND (expires < NOW() OR device_info ~ 'v2[.]3([.]|$)') RETURNING device_id`, [skip]);
       await client.query("UPDATE one_time_jobs SET info = $1 WHERE name = '2026-10-22 +3 days expired or 2.3'", [r.rows.map(x => x.device_id).join(',')]);
       console.log(`Разовая правка: +3 дня истёкшим и всем на 2.3 — ${r.rows.length} устройств`);
     }
