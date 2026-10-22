@@ -588,19 +588,33 @@ app.get('/admin/view-devices', async (req, res) => {
     const devicesQuery = await pool.query('SELECT * FROM devices ORDER BY last_seen DESC NULLS LAST');
     const keysQuery = await pool.query('SELECT * FROM app_keys');
     const trialsQuery = await pool.query('SELECT COUNT(*) FROM trial_history');
-    const referralsQuery = await pool.query('SELECT device_id, code, referred_by, rewarded FROM referrals');
+    const referralsQuery = await pool.query('SELECT device_id, code, referred_by, rewarded, kept, revoked, purchase_rewarded, rewarded_at FROM referrals');
 
     const refByDevice = new Map(referralsQuery.rows.map(r => [r.device_id, r]));
+    const ownerOfCode = new Map(referralsQuery.rows.map(r => [r.code, r.device_id]));
+    const devById = new Map(devicesQuery.rows.map(d => [d.device_id, d]));
     const invitedByCode = new Map();
     let referredDevices = 0;
     for (const r of referralsQuery.rows) {
       if (!r.referred_by) continue;
       referredDevices++;
-      const s = invitedByCode.get(r.referred_by) || { invited: 0, paid: 0 };
+      const s = invitedByCode.get(r.referred_by) || { invited: 0, paid: 0, list: [] };
       s.invited++;
-      if (r.rewarded) s.paid++;
+      if (r.purchase_rewarded) s.paid++;
+      s.list.push(r);
       invitedByCode.set(r.referred_by, s);
     }
+    // Кто это: модель телефона и начало ID (полный ID — в подсказке).
+    const whoHtml = id => {
+      const d = devById.get(id);
+      return `<code title="${escapeHtml(id)}">${escapeHtml(String(id).slice(0, 8))}…</code>${d && d.device_info ? ' ' + escapeHtml(phoneOf(d.device_info)) : ''}`;
+    };
+    // Что с бонусом за этого друга.
+    const bonusOf = r => r.purchase_rewarded ? '💎 купил ключ — бонус окончательный'
+      : r.revoked ? '✖ бонус снят — не пользовался'
+      : r.kept ? '✔ пользуется, +2 дн. остались'
+      : r.rewarded ? `⏳ +2 дн. на проверке до ${escapeHtml(shortDate(new Date(new Date(r.rewarded_at).getTime() + 7 * 86400e3)))}`
+      : 'ввёл код';
 
     const now = Date.now();
 
@@ -693,12 +707,16 @@ app.get('/admin/view-devices', async (req, res) => {
       const ref = refByDevice.get(dev.device_id);
       const refParts = [];
       if (ref) {
-        const s = invitedByCode.get(ref.code) || { invited: 0, paid: 0 };
+        const s = invitedByCode.get(ref.code) || { invited: 0, paid: 0, list: [] };
         refParts.push(`реф. код <b>${escapeHtml(ref.code)}</b> · пригласил ${s.invited} (купили ${s.paid})`);
-        if (ref.referred_by) refParts.push(`пришёл по коду ${escapeHtml(ref.referred_by)}`);
+        if (ref.referred_by) {
+          const from = ownerOfCode.get(ref.referred_by);
+          refParts.push(`пришёл по коду ${escapeHtml(ref.referred_by)}${from ? ' от ' + whoHtml(from) : ''} · ${bonusOf(ref)}`);
+        }
+        for (const f of s.list) refParts.push(`→ пригласил ${whoHtml(f.device_id)}: ${bonusOf(f)}`);
       }
       const refHtml = refParts.length
-        ? `<div style="font-size:12px;color:#4a5568;margin-top:3px;">${refParts.join(' · ')}</div>`
+        ? `<div style="font-size:12px;color:#4a5568;margin-top:3px;line-height:1.5;">${refParts.join('<br>')}</div>`
         : '';
 
       const expDate = new Date(dev.expires);
