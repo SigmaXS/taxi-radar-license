@@ -66,8 +66,34 @@ async function initDB() {
       );
     `);
     console.log("Database initialized successfully.");
+    await oneTimeJobs();
   } catch (err) {
     console.error("DB init error:", err);
+  }
+}
+
+// Разовые правки данных: каждая выполняется ровно один раз (отметка в one_time_jobs), перезапуски не повторяют.
+async function oneTimeJobs() {
+  await pool.query('CREATE TABLE IF NOT EXISTS one_time_jobs (name VARCHAR(100) PRIMARY KEY, done_at TIMESTAMP NOT NULL DEFAULT NOW(), info TEXT)');
+  // 2026-10-22: надбавка Яндекса не работала — всем, у кого срок истёк и стоит 2.3 / 2.3.1, +3 дня от сегодня.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const job = await client.query("INSERT INTO one_time_jobs (name) VALUES ('2026-10-22 +3 days expired 2.3') ON CONFLICT DO NOTHING RETURNING name");
+    if (job.rows.length) {
+      const r = await client.query(
+        `UPDATE devices SET expires = NOW() + INTERVAL '3 days'
+          WHERE expires < NOW() AND COALESCE(status, '') NOT IN ('banned', 'disabled')
+            AND device_info ~ 'v2[.]3([.]|$)' RETURNING device_id`);
+      await client.query("UPDATE one_time_jobs SET info = $1 WHERE name = '2026-10-22 +3 days expired 2.3'", [r.rows.map(x => x.device_id).join(',')]);
+      console.log(`Разовая правка: +3 дня истёкшим на 2.3 — ${r.rows.length} устройств`);
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('one-time jobs:', e.message);
+  } finally {
+    client.release();
   }
 }
 
