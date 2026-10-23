@@ -159,3 +159,26 @@ test('a listed scout phone that is not scouting is queued like a driver', async 
   await f.call('/api/scout/near', { lat: 47.01, lon: 28.86 }, 'scout-1'); // разведывает — своё место не ставим
   assert.equal((await f.call('/api/scout/queue', {}, 'scout-1')).points.length, 1);
 });
+
+test('tap on the widget: driver point goes first even if checked 40 s ago', async () => {
+  const f = fixture();
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85 }, 'd1');
+  await f.call('/api/scout/near', { lat: 47.01, lon: 28.86 }, 'd2');
+  await f.call('/api/scout/result', { lat: 47.0, lon: 28.85, values: { econom: 15, comfort: 15, comfortplus: 15 } }, 'scout-1');
+  f.tick(40e3);
+  await f.call('/api/scout/near', { lat: 47.0, lon: 28.85, urgent: true }, 'd1');
+  const pts = (await f.call('/api/scout/tasks', { limit: 1 }, 'scout-1')).points;
+  assert.ok(Math.abs(pts[0].lat - 47.0) < 1e-9);
+});
+
+test('map flag: probe queues the point urgently and answers exact after the check', async () => {
+  const f = fixture();
+  const first = await f.call('/api/scout/probe', { lat: 47.02, lon: 28.83 }, 'd1');
+  assert.equal(first.surge, null); assert.equal(first.exact, false);
+  const pts = (await f.call('/api/scout/tasks', {}, 'scout-1')).points;
+  assert.equal(pts.length, 1);
+  await f.call('/api/scout/result', { ...pts[0], values: { econom: 35, comfort: 35, comfortplus: 35 } }, 'scout-1');
+  const again = await f.call('/api/scout/probe', { lat: 47.0201, lon: 28.8301 }, 'd1');
+  assert.equal(again.surge, 35); assert.equal(again.exact, true);
+  assert.equal((await f.call('/api/scout/tasks', {}, 'scout-1')).points.length, 0); // флажок — не место водителя
+});

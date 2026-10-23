@@ -84,6 +84,17 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
   }
   const nearestOrAround = p => nearest(p) || nearest(p, FALLBACK_KM, FALLBACK_MS);
 
+  // Срочно: водитель нажал на виджет или поставил флажок на карте — разведчик берёт эту точку первой,
+  // даже если её проверяли полминуты назад. Висит 2 минуты или до первой проверки.
+  const URGENT_MS = 2 * 60e3, URGENT_RECHECK_MS = 30e3;
+  const urgent = new Map(); // клетка → { until, lease }
+  function hurry(lat, lon) {
+    const key = cellOf(lat, lon);
+    const u = urgent.get(key) || { lease: 0 };
+    u.until = now() + URGENT_MS;
+    urgent.set(key, u);
+  }
+
   // Чья точка: водитель уехал — его старая клетка сразу уходит из очереди (если там больше никого),
   // а не висит ещё 3 минуты. Так же с точкой Б: новая заменяет старую, нет Б — заказ кончился.
   const byDevice = new Map(); // device → { here: клетка, b: клетка Б, at }
@@ -122,6 +133,7 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
       // Разведчик за работой лежит дома с Яндекс Go — его место проверять незачем. Телефон из списка,
       // который сейчас не разведывает (водитель взял его в машину), — обычный водитель.
       if (!scouting(deviceId)) want(lat, lon, false, deviceId);
+      if (req.body.urgent) hurry(lat, lon);
       const r = nearestOrAround({ lat, lon });
       if (r) Object.assign(out, { surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
       else Object.assign(out, { surge: null, scouting: scouts().length > 0 });
@@ -130,6 +142,24 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
       if (km(CENTER, { lat: b_lat, lon: b_lon }) > radiusKm()) out.surge_b = 0;
       else { if (!scouting(deviceId)) want(b_lat, b_lon, true, deviceId); const rb = nearestOrAround({ lat: b_lat, lon: b_lon }); out.surge_b = rb ? rb.value : null; }
     } else forget(deviceId, true);
+    res.json(out);
+  }));
+
+  // Карта: надбавка в точке флажка. Флажок — не место водителя: в очередь как срочная, место водителя не трогаем.
+  // exact — проверена именно эта клетка (иначе — ближайшая проверка рядом).
+  app.post('/api/scout/probe', member(async (req, res) => {
+    const { lat, lon } = req.body;
+    if (!okCoord(lat, lon)) return res.status(400).json({ ok: false, code: 'bad_point' });
+    if (km(CENTER, { lat, lon }) > radiusKm()) return res.json({ ok: true, surge: 0, far: true, exact: true });
+    const key = cellOf(lat, lon);
+    const own = results.get(key);
+    const fresh = own && now() - own.at <= URGENT_RECHECK_MS;
+    if (!fresh && req.body.ask !== false) hurry(lat, lon);
+    const r = nearestOrAround({ lat, lon });
+    const out = { ok: true, exact: !!fresh, scouting: scouts().length > 0 };
+    if (fresh) Object.assign(out, { surge: own.value, values: own.values, age_s: Math.round((now() - own.at) / 1000) });
+    else if (r) Object.assign(out, { surge: r.value, values: r.values, age_s: Math.round((now() - r.at) / 1000) });
+    else out.surge = null;
     res.json(out);
   }));
 
@@ -185,15 +215,22 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     const limit = Math.min(Math.max(parseInt(req.body.limit, 10) || 8, 1), 20);
     const drivers = [...wanted.values()].filter(w => !w.b).length;
     const recheck = drivers <= FEW ? RECHECK_FEW_MS : RECHECK_MS;
+    for (const [k, u] of urgent) if (u.until < t) urgent.delete(k);
+    // Срочные (тап по виджету, флажок на карте) — первыми, если их не проверяли последние 30 с.
+    const hot = [...urgent.entries()]
+      .filter(([k, u]) => u.lease < t && (wanted.get(k)?.lease || 0) < t && t - (results.get(k)?.at || 0) > URGENT_RECHECK_MS)
+      .map(([k, u]) => ({ k, u }));
+    const hotKeys = new Set(hot.map(x => x.k));
     const list = [...wanted.entries()]
-      .filter(([, w]) => w.lease < t)
+      .filter(([k, w]) => w.lease < t && !hotKeys.has(k))
       .map(([k, w]) => ({ k, w, checked: results.get(k)?.at || 0 }))
       // Точки водителей — раз в минуту; точки Б — раз в 2,5 мин и в конце очереди.
       .filter(x => t - x.checked > (x.w.b ? RECHECK_B_MS : recheck))
-      .sort((a, b) => (a.w.b - b.w.b) || (a.checked - b.checked))
-      .slice(0, limit);
-    list.forEach(x => { x.w.lease = t + Math.min(LEASE_MS, recheck); });
-    res.json({ ok: true, points: list.map(x => ({ ...centerOf(x.k) })) });
+      .sort((a, b) => (a.w.b - b.w.b) || (a.checked - b.checked));
+    const lease = t + Math.min(LEASE_MS, recheck);
+    const picked = [...hot, ...list].slice(0, limit);
+    picked.forEach(x => { if (x.u) x.u.lease = t + URGENT_RECHECK_MS; const w = wanted.get(x.k); if (w) w.lease = lease; });
+    res.json({ ok: true, points: picked.map(x => ({ ...centerOf(x.k) })) });
   }));
 
   // Разведчик: результат по точке. values — надбавка по тарифам (null — «нет свободных машин» / не прочитано).
@@ -209,6 +246,7 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     store(key, { at: now(), value, values, lat, lon });
     hp(deviceId).result = now();
     const w = wanted.get(key); if (w) w.lease = 0;
+    urgent.delete(key);
     const spread = Object.values(values).filter(Number.isInteger);
     if (spread.length > 1 && Math.max(...spread) !== Math.min(...spread)) {
       console.log(`scout: разные надбавки по тарифам в ${lat.toFixed(4)},${lon.toFixed(4)}: ${JSON.stringify(values)} — проверьте скидки аккаунта разведчика`);
