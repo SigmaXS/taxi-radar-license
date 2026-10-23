@@ -714,7 +714,7 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
 
   // ---------- табло прилётов (см. airport.js) ----------
 
-  const airportBoard = require('./airport')();
+  const airportBoard = require('./airport')(pool);
   // Открыто: только состояние источников, без ключей и без самих рейсов.
   app.get('/api/airport/board-status', (req, res) => res.json(airportBoard.status()));
 

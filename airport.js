@@ -50,9 +50,26 @@ function etaFor(f) {
   return chisinauTime(Date.now() + (km / speed) * 3600 * 1000 + 8 * 60 * 1000);
 }
 
-module.exports = function airportBoard() {
+module.exports = function airportBoard(pool) {
   const av = { configured: false, updated: null, fetchedAt: 0, count: 0, error: null, flights: [], inFlight: null };
   const al = { configured: false, updated: null, fetchedAt: 0, count: 0, error: null, plan: null, live: new Map(), inFlight: null };
+
+  // Табло — в базе: перезапуск сервера не стирает рейсы и не тратит бесплатные запросы заново
+  // (у Aviationstack их всего 100 в месяц).
+  const ready = !pool ? Promise.resolve() : pool.query(`CREATE TABLE IF NOT EXISTS airport_board (
+      src VARCHAR(20) PRIMARY KEY, fetched_at BIGINT NOT NULL, updated TEXT, data TEXT NOT NULL)`)
+    .then(() => pool.query('SELECT src, fetched_at, updated, data FROM airport_board'))
+    .then(r => r.rows.forEach(x => {
+      const d = JSON.parse(x.data);
+      if (x.src === 'av') { av.flights = d; av.count = d.length; av.fetchedAt = Number(x.fetched_at); av.updated = x.updated; }
+      if (x.src === 'al') { al.live = new Map(d); al.count = al.live.size; al.fetchedAt = Number(x.fetched_at); al.updated = x.updated; }
+    }))
+    .catch(e => console.error('airport_board:', e.message));
+  function save(src, data, fetchedAt, updated) {
+    if (!pool) return;
+    pool.query(`INSERT INTO airport_board (src, fetched_at, updated, data) VALUES ($1, $2, $3, $4)
+      ON CONFLICT (src) DO UPDATE SET fetched_at = $2, updated = $3, data = $4`, [src, fetchedAt, updated, JSON.stringify(data)]).catch(() => {});
+  }
 
   async function fetchAviationstack(key) {
     // Бесплатный тариф Aviationstack — только http.
@@ -78,6 +95,7 @@ module.exports = function airportBoard() {
       }))
       .filter(f => f.sched && !seen.has(f.flight + f.sched) && seen.add(f.flight + f.sched));
     av.count = av.flights.length;
+    save('av', av.flights, Date.now(), av.updated);
   }
 
   async function fetchAirLabs(key) {
@@ -98,6 +116,7 @@ module.exports = function airportBoard() {
       if (flight && eta) al.live.set(flight, { eta, from: f.dep_iata || '' });
     }
     al.count = al.live.size;
+    save('al', [...al.live], Date.now(), al.updated);
   }
 
   // Обновить источник, если данные устарели; один запрос на всех водителей.
@@ -115,6 +134,7 @@ module.exports = function airportBoard() {
 
   /** Рейсы сегодняшнего дня (и прошлых 3 часов) по времени: для экрана «Аэропорт». */
   async function flights() {
+    await ready;
     await Promise.all([
       refresh(av, 'AVIATIONSTACK_KEY', AV_CACHE_MS, fetchAviationstack),
       refresh(al, 'AIRLABS_KEY', AL_CACHE_MS, fetchAirLabs)
