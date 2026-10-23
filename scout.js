@@ -30,8 +30,11 @@ const okCoord = (lat, lon) => typeof lat === 'number' && typeof lon === 'number'
   lat > 45 && lat < 49 && lon > 26 && lon < 31;
 const okSurge = v => v === null || (Number.isInteger(v) && v >= 0 && v <= 500);
 
-/** Надбавка в точке одна на все тарифы: берём значение большинства известных тарифов (при равенстве — большее). */
+/** Надбавка в точке одна на все тарифы. Главный — Эконом: его старт (30) надёжен, и водители сверяют именно его.
+ *  Комфорт/Комфорт+ в Go могут считаться иначе (другой старт, скидка аккаунта) и раньше перевешивали Эконом
+ *  большинством (Эконом +15, а водителям уходило +6). Без Эконома — значение большинства остальных (при равенстве — большее). */
 function single(values) {
+  if (Number.isInteger(values.econom)) return values.econom;
   const known = Object.values(values).filter(v => Number.isInteger(v));
   if (!known.length) return null;
   const count = new Map();

@@ -63,7 +63,9 @@ test('a point handed to the scout is not handed out again for a minute', async (
 
 test('majority value across tariffs; ties take the larger', () => {
   assert.equal(register.single({ econom: 15, comfort: 15, comfortplus: 35 }), 15);
-  assert.equal(register.single({ econom: 15, comfort: 35, comfortplus: null }), 35);
+  assert.equal(register.single({ econom: 15, comfort: 35, comfortplus: null }), 15);
+  assert.equal(register.single({ econom: 15, comfort: 6, comfortplus: 6 }), 15, 'Econom wins over a comfort majority');
+  assert.equal(register.single({ econom: null, comfort: 35, comfortplus: 15 }), 35);
   assert.equal(register.single({ econom: null, comfort: null, comfortplus: null }), null);
 });
 
