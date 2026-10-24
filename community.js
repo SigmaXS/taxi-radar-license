@@ -745,6 +745,14 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true, ...r });
   }));
 
+  // Что по координатам (улица, дом, район) — для подсказки «рядом +35: Ботаника, ул. Дечебал 44».
+  app.post('/api/geocode/reverse', member(async (req, res, deviceId) => {
+    if (tooOften('grev:' + deviceId, 30, 10 * 60 * 1000)) return res.json({ ok: false, message: 'Слишком часто' });
+    const place = await geocoder.reverse(Number(req.body.lat), Number(req.body.lon));
+    if (!place) return res.json({ ok: false, message: 'Геокодер недоступен' });
+    res.json({ ok: true, ...place });
+  }));
+
   // Поиск адреса на карте: до 6 вариантов, ближайшие к водителю первыми.
   app.post('/api/geocode/search', member(async (req, res, deviceId) => {
     if (tooOften('gsearch:' + deviceId, 40, 10 * 60 * 1000)) {

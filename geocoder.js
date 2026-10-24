@@ -173,6 +173,41 @@ module.exports = function createGeocoder(pool) {
     return null;
   }
 
+  // Что по координатам: улица, дом и район («Ботаника», «Чеканы»). Для подсказки «рядом +35».
+  // Кэш — по клеткам ~200 м на неделю: надбавка горит на квартал, а лимит геокодера не бесконечный.
+  const reverseCache = new Map();
+  async function reverse(lat, lon) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    const cacheKey = (Math.round(lat / 0.002) * 0.002).toFixed(3) + ',' + (Math.round(lon / 0.002) * 0.002).toFixed(3);
+    const hit = reverseCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < 7 * 24 * 3600 * 1000) return hit.place;
+    for (const key of usableKeys()) {
+      used.set(key, (used.get(key) || 0) + 1);
+      const url = 'https://geocode-maps.yandex.ru/1.x/?apikey=' + encodeURIComponent(key) +
+        `&geocode=${lon},${lat}&kind=house&results=1&format=json&lang=ru_RU`;
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+        if (r.status === 403 || r.status === 429) { rejected.add(key); continue; }
+        if (!r.ok) return null;
+        const m = (await r.json()).response.GeoObjectCollection.featureMember[0];
+        const comps = (m && m.GeoObject.metaDataProperty.GeocoderMetaData.Address.Components) || [];
+        const part = kind => (comps.filter(c => c.kind === kind).pop() || {}).name || '';
+        const place = {
+          street: part('street'), house: part('house'),
+          // «сектор Ботаника» → «Ботаника»; у пригородов района нет — берём населённый пункт.
+          district: part('district').replace(/^(сектор|sectorul)\s+/i, '') || part('locality')
+        };
+        reverseCache.set(cacheKey, { at: Date.now(), place });
+        if (reverseCache.size > 3000) reverseCache.delete(reverseCache.keys().next().value);
+        return place;
+      } catch (err) {
+        console.error('Geocoder reverse:', err.message);
+        return null;
+      }
+    }
+    return null;
+  }
+
   // OpenStreetMap: знает заведения по названию (Radisson Blu, Mall Dova, кафе), которых
   // нет в геокодере Яндекса. Бесплатно, без ключа, но не чаще раза в секунду — запросы по очереди.
   let osmChain = Promise.resolve();
@@ -426,7 +461,7 @@ module.exports = function createGeocoder(pool) {
     };
   }
 
-  return { lookupRoute, lookup, search, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize, findAny, autoResolveMisses };
+  return { lookupRoute, lookup, search, reverse, status, enabled, miss, learn, setAdminPoint, removePoint, dismissMiss, adminData, normalize, findAny, autoResolveMisses };
 };
 
 // Yandex coordinates used for routing must resolve the requested locality and a house, not a district centroid.
