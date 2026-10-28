@@ -81,16 +81,12 @@ module.exports = function setupWeekly(app, pool, { escapeHtml, latestVersion }) 
   setInterval(() => tick().catch(e => console.error('weekly:', e.message)), 3600e3).unref();
   setTimeout(() => tick().catch(() => {}), 90e3).unref();
 
-  // Сейчас, а не за неделю: разведчик надбавки и расход бесплатного лимита сервисов маршрутов.
+  // Сейчас, а не за неделю: расход бесплатного лимита сервисов маршрутов.
   function live(req) {
-    const s = req.app.locals.scoutStats?.();
     const r = req.app.locals.routeStats?.() || [];
-    const scout = !s ? 'не подключён' : !s.scouts ? 'нет телефонов (SCOUT_DEVICE_IDS пуст)' :
-      `телефонов ${s.scouts} · ждут проверки ${s.wanted} точек · свежих результатов ${s.fresh} (с надбавкой ${s.hot})` +
-      (s.lastAgeSec == null ? ' · результатов ещё не было' : ` · последний ${s.lastAgeSec < 120 ? s.lastAgeSec + ' с' : Math.round(s.lastAgeSec / 60) + ' мин'} назад`);
     const routes = r.filter(x => x.configured).map(x => `${x.name}: ${x.used} из ${x.limit === Infinity ? '∞' : x.limit} за ${x.period === 'day' ? 'сутки' : 'месяц'}${x.exhausted ? ' — лимит' : ''}`).join(' · ') || 'ключей нет';
     return `<p style="font-size:15px;line-height:1.6;margin-top:14px;border-top:1px solid #e2e8f0;padding-top:12px;">
-      <b>🛰 Разведчик надбавки:</b> ${escapeHtml(scout)}<br><b>🗺 Маршруты:</b> ${escapeHtml(routes)}</p>`;
+      <b>🗺 Маршруты:</b> ${escapeHtml(routes)}</p>`;
   }
 
   app.get('/admin/weekly', async (req, res) => {
