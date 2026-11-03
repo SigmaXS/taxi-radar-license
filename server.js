@@ -189,6 +189,8 @@ app.locals.latestVersion = updates.latestVersion;
 const notices = require('./notices')(app, pool, { isValidDeviceId, escapeHtml });
 // Недельная сводка (/admin/weekly, в Telegram по понедельникам).
 require('./weekly')(app, pool, { escapeHtml, latestVersion: updates.latestVersion });
+// Оплата переводом MIA: «Я оплатил» → Telegram админу → «✓ Пришло» продлевает подписку (/admin/payments).
+const payments = require('./payments')(app, pool, { isValidDeviceId, escapeHtml, parseTariffs, rewardReferrer });
 
 app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
 
@@ -271,7 +273,9 @@ app.get('/api/app-config', (req, res) => {
     // Загруженный на /admin/apk файл: версия, «что нового» и ссылка на скачивание.
     ...updates.configFields('https://' + req.get('host')),
     // Сообщение водителям из админки (баннер на главной).
-    ...notices.configFields()
+    ...notices.configFields(),
+    // Номер и имя получателя для оплаты переводом MIA.
+    ...payments.configFields()
   });
 });
 

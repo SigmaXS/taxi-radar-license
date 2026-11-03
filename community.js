@@ -519,6 +519,137 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true });
   }));
 
+  // ---------- помощь на дороге и «опасность» ----------
+  // Водитель просит помощь (колесо, прикурить, бензин, буксир) с суммой, которую готов
+  // заплатить, — радары водителей рядом раз в 30 секунд забирают заявки. Номер и точку
+  // видит только тот, кто нажал «Помогу». «Опасность» — сразу всем в 10 км, с точкой и номером.
+  // Деньги водители передают друг другу сами, сервер их не касается.
+  const HELP_KINDS = ['tire', 'jump', 'fuel', 'tow', 'other', 'danger'];
+  const HELP_MINUTES = 60;
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS help_requests (
+      id BIGSERIAL PRIMARY KEY,
+      device_id VARCHAR(100) NOT NULL,
+      kind VARCHAR(10) NOT NULL,
+      price INT NOT NULL DEFAULT 0,
+      phone VARCHAR(20) NOT NULL,
+      note VARCHAR(120),
+      lat DOUBLE PRECISION NOT NULL,
+      lon DOUBLE PRECISION NOT NULL,
+      status VARCHAR(8) NOT NULL DEFAULT 'open',
+      created TIMESTAMP NOT NULL DEFAULT NOW(),
+      expires TIMESTAMP NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS help_requests_open ON help_requests (status, expires);
+    CREATE TABLE IF NOT EXISTS help_helpers (
+      request_id BIGINT NOT NULL,
+      device_id VARCHAR(100) NOT NULL,
+      phone VARCHAR(20),
+      lat DOUBLE PRECISION,
+      lon DOUBLE PRECISION,
+      created TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (request_id, device_id)
+    );
+  `).catch(err => console.error('help init error:', err));
+
+  function metersBetween(lat1, lon1, lat2, lon2) {
+    const rad = Math.PI / 180, dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+    return Math.round(6371000 * 2 * Math.asin(Math.sqrt(a)));
+  }
+  // Номер как набрал водитель: «078…» → «+37378…», чтобы по нему сразу звонили.
+  const helpPhone = v => { const p = String(v || '').replace(/[^\d+]/g, '').slice(0, 16); return /^0\d{8}$/.test(p) ? '+373' + p.slice(1) : p; };
+  // Сначала 5 км; никто не откликнулся за 3 минуты — 10 км. «Опасность» — сразу 10 км.
+  const helpRadius = r => (r.kind === 'danger' || Date.now() - new Date(r.created).getTime() > 3 * 60 * 1000) ? 10000 : 5000;
+
+  app.post('/api/help/create', member(async (req, res, deviceId) => {
+    const b = req.body;
+    const kind = b.kind, lat = Number(b.lat), lon = Number(b.lon);
+    const phone = helpPhone(b.phone);
+    const price = kind === 'danger' ? 0 : Math.max(0, Math.min(5000, parseInt(b.price, 10) || 0));
+    if (!HELP_KINDS.includes(kind) || !validPoint(lat, lon)) return res.json({ ok: false, message: 'Нет точки GPS' });
+    if (phone.replace(/\D/g, '').length < 8) return res.json({ ok: false, message: 'Укажите номер телефона' });
+    if (tooOften('help:' + deviceId, 6, 24 * 60 * 60 * 1000)) return res.json({ ok: false, message: 'Не больше 6 заявок в сутки' });
+    // Одна активная заявка на водителя: новая заменяет старую.
+    await pool.query(`UPDATE help_requests SET status = 'cancel' WHERE device_id = $1 AND status = 'open'`, [deviceId]);
+    const r = await pool.query(
+      `INSERT INTO help_requests (device_id, kind, price, phone, note, lat, lon, expires)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + ($8 || ' minutes')::INTERVAL) RETURNING id`,
+      [deviceId, kind, price, phone, cleanText(b.note, 120) || null, lat, lon, String(HELP_MINUTES)]
+    );
+    res.json({ ok: true, id: Number(r.rows[0].id) });
+  }));
+
+  app.post('/api/help/nearby', member(async (req, res, deviceId) => {
+    const lat = Number(req.body.lat), lon = Number(req.body.lon);
+    if (!validPoint(lat, lon)) return res.json({ ok: true, requests: [] });
+    const rows = (await pool.query(
+      `SELECT h.*, (SELECT COUNT(*) FROM help_helpers x WHERE x.request_id = h.id) AS helpers,
+              EXISTS (SELECT 1 FROM help_helpers x WHERE x.request_id = h.id AND x.device_id = $5) AS mine_help
+       FROM help_requests h
+       WHERE h.status = 'open' AND h.expires > NOW() AND h.device_id <> $5
+         AND h.lat BETWEEN $1 AND $2 AND h.lon BETWEEN $3 AND $4
+       ORDER BY h.created DESC LIMIT 30`,
+      [lat - 0.1, lat + 0.1, lon - 0.14, lon + 0.14, deviceId]
+    )).rows;
+    res.json({
+      ok: true,
+      requests: rows.map(r => ({ r, dist: metersBetween(lat, lon, r.lat, r.lon) }))
+        .filter(x => x.dist <= helpRadius(x.r))
+        .map(({ r, dist }) => {
+          const open = r.kind === 'danger' || r.mine_help;
+          return {
+            id: Number(r.id), kind: r.kind, price: r.price, note: r.note || '', dist,
+            created: new Date(r.created).toISOString(), helpers: Number(r.helpers), accepted: r.mine_help,
+            // Номер и точку — только тому, кто взялся помочь (и всем — при опасности).
+            ...(open ? { phone: r.phone, lat: r.lat, lon: r.lon } : {})
+          };
+        })
+    });
+  }));
+
+  app.post('/api/help/accept', member(async (req, res, deviceId) => {
+    const id = Number(req.body.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.json({ ok: false, message: 'Неверная заявка' });
+    const r = (await pool.query(`SELECT * FROM help_requests WHERE id = $1 AND status = 'open' AND expires > NOW()`, [id])).rows[0];
+    if (!r) return res.json({ ok: false, message: 'Заявка уже закрыта' });
+    if (r.device_id === deviceId) return res.json({ ok: false, message: 'Это ваша заявка' });
+    const lat = Number(req.body.lat), lon = Number(req.body.lon);
+    const here = validPoint(lat, lon);
+    await pool.query(
+      `INSERT INTO help_helpers (request_id, device_id, phone, lat, lon) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (request_id, device_id) DO UPDATE SET phone = COALESCE($3, help_helpers.phone), lat = $4, lon = $5`,
+      [id, deviceId, helpPhone(req.body.phone) || null, here ? lat : null, here ? lon : null]
+    );
+    res.json({ ok: true, request: { id, kind: r.kind, price: r.price, note: r.note || '', phone: r.phone, lat: r.lat, lon: r.lon } });
+  }));
+
+  // Своя открытая заявка и кто откликнулся (с номером, если он его указал).
+  app.post('/api/help/mine', member(async (req, res, deviceId) => {
+    const r = (await pool.query(
+      `SELECT * FROM help_requests WHERE device_id = $1 AND status = 'open' AND expires > NOW() ORDER BY created DESC LIMIT 1`, [deviceId]
+    )).rows[0];
+    if (!r) return res.json({ ok: true, request: null, helpers: [] });
+    const helpers = (await pool.query(
+      `SELECT h.phone, h.lat, h.lon, h.created, u.nickname FROM help_helpers h LEFT JOIN chat_users u ON u.device_id = h.device_id
+       WHERE h.request_id = $1 ORDER BY h.created`, [r.id]
+    )).rows;
+    res.json({
+      ok: true,
+      request: { id: Number(r.id), kind: r.kind, price: r.price, note: r.note || '', created: new Date(r.created).toISOString(), expires: new Date(r.expires).toISOString() },
+      helpers: helpers.map(h => ({
+        phone: h.phone || '', nickname: h.nickname || '',
+        dist: h.lat == null ? null : metersBetween(r.lat, r.lon, h.lat, h.lon),
+        created: new Date(h.created).toISOString()
+      }))
+    });
+  }));
+
+  app.post('/api/help/close', member(async (req, res, deviceId) => {
+    await pool.query(`UPDATE help_requests SET status = 'done' WHERE device_id = $1 AND status = 'open'`, [deviceId]);
+    res.json({ ok: true });
+  }));
+
   // ---------- общие пробки: обучение на поездках всех водителей ----------
 
   // Пример: сколько ехать по OSRM (пустые дороги) и сколько по Яндексу в этот час.
