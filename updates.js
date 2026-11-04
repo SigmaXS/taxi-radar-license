@@ -131,7 +131,7 @@ document.getElementById('f').onsubmit = async e => {
       res.end(file.data);
     } catch (e) {
       console.error('apk download error:', e.message);
-      if (!res.headersSent) res.status(500).send('Ошибка сервера, попробуйте ещё раз');
+      if (!res.headersSent) res.status(500).send('Ошибка сервера, попробуйте ещё раз [' + String(e.message).slice(0, 120) + ']');
     }
   });
 }
