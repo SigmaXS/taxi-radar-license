@@ -63,8 +63,8 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
     if (!isValidDeviceId(b.device_id)) return res.status(400).json({ ok: false, message: 'Нет ID' });
     const phone = String(b.phone || '').replace(/[^\d+]/g, '').slice(0, 16);
     if (phone.replace(/\D/g, '').length < 8) return res.json({ ok: false, message: 'Укажите свой номер телефона' });
-    const product = b.product === 'cancel' ? 'cancel' : 'radar';
-    const tariff = product === 'cancel'
+    const product = ['cancel', 'both'].includes(b.product) ? b.product : 'radar';
+    const tariff = product !== 'radar'
       ? { days: 30, price: Number(process.env.CANCEL_PRICE || 999) }
       : parseTariffs().find(t => t.days === parseInt(b.days, 10));
     if (!tariff) return res.json({ ok: false, message: 'Тариф не найден, обновите экран' });
@@ -119,6 +119,21 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
   });
 
   async function extend(claim) {
+    if (claim.product === 'both') {
+      const r = await pool.query(
+        `INSERT INTO devices (device_id, expires, cancel_expires, last_seen, status, type)
+         VALUES ($1, NOW() + ($2 || ' days')::INTERVAL, NOW() + ($2 || ' days')::INTERVAL, NOW(), 'active', $3)
+         ON CONFLICT (device_id) DO UPDATE SET
+           expires = CASE WHEN devices.status <> 'disabled' AND devices.expires > NOW() THEN devices.expires ELSE NOW() END + ($2 || ' days')::INTERVAL,
+           cancel_expires = CASE WHEN devices.cancel_expires > NOW() THEN devices.cancel_expires ELSE NOW() END + ($2 || ' days')::INTERVAL,
+           status = CASE WHEN devices.status = 'banned' THEN devices.status ELSE 'active' END,
+           last_seen = NOW()
+         RETURNING expires, status`,
+        [claim.device_id, String(claim.days), `MIA ${claim.price} L, Радар + Отмена ${claim.days} дн.`]
+      );
+      try { await rewardReferrer(claim.device_id); } catch (e) { console.error('Referral reward error:', e); }
+      return r.rows[0];
+    }
     if (claim.product === 'cancel') {
       const r = await pool.query(
         `INSERT INTO devices (device_id, cancel_expires, last_seen, status, type)
