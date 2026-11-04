@@ -64,9 +64,11 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
     const phone = String(b.phone || '').replace(/[^\d+]/g, '').slice(0, 16);
     if (phone.replace(/\D/g, '').length < 8) return res.json({ ok: false, message: 'Укажите свой номер телефона' });
     const product = ['cancel', 'both'].includes(b.product) ? b.product : 'radar';
-    const tariff = product !== 'radar'
-      ? { days: 30, price: Number(process.env.CANCEL_PRICE || 999) }
-      : parseTariffs().find(t => t.days === parseInt(b.days, 10));
+    const days = parseInt(b.days, 10);
+    const plans = require('./plans');
+    const tariff = product === 'both' ? { days: 30, price: plans.bundlePrice() }
+      : product === 'cancel' ? plans.cancelTariffs().find(t => t.days === days)
+      : parseTariffs().find(t => t.days === days);
     if (!tariff) return res.json({ ok: false, message: 'Тариф не найден, обновите экран' });
     // Не чаще раза в 2 минуты с одного телефона (двойное нажатие, повторы).
     const last = recent.get(b.device_id) || 0;

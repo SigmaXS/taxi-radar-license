@@ -4,6 +4,9 @@
 // Таблицы: app_keys.product ('radar' | 'cancel'), devices.cancel_key,
 // devices.cancel_expires, devices.cancel_trial_at, devices.cancel_banned.
 
+const guard = require('./guard');
+const signing = require('./signing');
+
 const TRIAL_HOURS = 24;
 
 module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtml, generateCode, adminNav }) {
@@ -16,6 +19,13 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
   `).catch(err => console.error('cancel schema error:', err));
 
   const nowIso = d => (d ? new Date(d).toISOString() : null);
+
+  // Ответ «Отмены» с подписью (см. signing.js): приложение 2.5+ верит active:true только с ней.
+  function reply(req, res, deviceId, body) {
+    const out = { ...body };
+    if (out.active === undefined) out.active = false;
+    res.json(signing.signed(req, 'cancel', deviceId, out.active === true, out.expires || '', out));
+  }
 
   async function readStatus(deviceId) {
     const r = await pool.query(
@@ -37,11 +47,11 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
   }
 
   // Статус подписки «Отмена» для устройства.
-  app.post('/api/cancel/status', async (req, res) => {
+  app.post('/api/cancel/status', guard.limitIp('cstatus', 600, 3600 * 1000), async (req, res) => {
     const deviceId = req.body && req.body.device_id;
     if (!isValidDeviceId(deviceId)) return res.status(400).json({ ok: false, message: 'Нет ID' });
     try {
-      res.json({ ok: true, ...(await readStatus(deviceId)) });
+      reply(req, res, deviceId, { ok: true, ...(await readStatus(deviceId)) });
     } catch (err) {
       console.error('cancel status error:', err);
       res.status(500).json({ ok: false, message: 'Ошибка базы данных' });
@@ -49,14 +59,17 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
   });
 
   // Пробный день: ровно один раз на устройство, отсчёт с первого включения.
-  app.post('/api/cancel/trial', async (req, res) => {
+  app.post('/api/cancel/trial', guard.limitIp('ctrial', 60, 3600 * 1000), async (req, res) => {
     const deviceId = req.body && req.body.device_id;
     if (!isValidDeviceId(deviceId)) return res.status(400).json({ ok: false, message: 'Нет ID' });
     try {
       const cur = await readStatus(deviceId);
-      if (cur.banned) return res.json({ ok: false, message: 'Устройство заблокировано' });
-      if (cur.active) return res.json({ ok: true, already: true, expires: cur.expires, hours_left: cur.hours_left });
-      if (!cur.trial_available) return res.json({ ok: false, message: 'Пробный день уже использован' });
+      if (cur.banned) return reply(req, res, deviceId, { ok: false, active: false, banned: true, message: 'Устройство заблокировано' });
+      if (cur.active) return reply(req, res, deviceId, { ok: true, active: true, already: true, expires: cur.expires, hours_left: cur.hours_left });
+      if (!cur.trial_available) return reply(req, res, deviceId, { ok: false, active: false, message: 'Пробный день уже использован' });
+      if (guard.tooMany('ctrialnew:' + guard.clientIp(req), parseInt(process.env.TRIAL_PER_IP_DAY || '30', 10), 24 * 3600 * 1000)) {
+        return reply(req, res, deviceId, { ok: false, active: false, message: 'С этого подключения уже много новых устройств. Напишите нам.' });
+      }
 
       const expires = new Date(Date.now() + TRIAL_HOURS * 3600 * 1000);
       await pool.query(
@@ -66,7 +79,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
          SET cancel_expires = $2, cancel_trial_at = NOW(), last_seen = NOW()`,
         [deviceId, expires]
       );
-      res.json({ ok: true, expires: expires.toISOString(), hours_left: TRIAL_HOURS });
+      reply(req, res, deviceId, { ok: true, active: true, expires: expires.toISOString(), hours_left: TRIAL_HOURS });
     } catch (err) {
       console.error('cancel trial error:', err);
       res.status(500).json({ ok: false, message: 'Ошибка базы данных' });
@@ -74,7 +87,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
   });
 
   // Активация ключа «Отмена». Ключ удаляется, срок добавляется к текущему.
-  app.post('/api/cancel/activate', async (req, res) => {
+  app.post('/api/cancel/activate', guard.limitIp('cactivate', 60, 3600 * 1000), async (req, res) => {
     const deviceId = req.body && req.body.device_id;
     const rawKey = req.body && req.body.key;
     if (!isValidDeviceId(deviceId) || typeof rawKey !== 'string' || !rawKey.trim()) {
@@ -83,18 +96,24 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     const key = rawKey.trim().toUpperCase();
     try {
       if ((await readStatus(deviceId)).banned) {
-        return res.json({ ok: false, message: 'Устройство заблокировано' });
+        return reply(req, res, deviceId, { ok: false, active: false, banned: true, message: 'Устройство заблокировано' });
+      }
+      // Перебор ключей: 10 неверных на устройство и 60 на IP в час.
+      if (guard.isBlocked('cbadkey:' + deviceId, 10, 3600 * 1000) || guard.isBlocked('cbadkeyip:' + guard.clientIp(req), 60, 3600 * 1000)) {
+        return reply(req, res, deviceId, { ok: false, active: false, message: 'Слишком много неверных ключей. Подождите час.' });
       }
       const del = await pool.query(
         "DELETE FROM app_keys WHERE key_code = $1 AND product = 'cancel' RETURNING *",
         [key]
       );
       if (!del.rows.length) {
-        return res.json({ ok: false, message: 'Ключ неверный или уже активирован' });
+        guard.record('cbadkey:' + deviceId, 3600 * 1000);
+        guard.record('cbadkeyip:' + guard.clientIp(req), 3600 * 1000);
+        return reply(req, res, deviceId, { ok: false, active: false, message: 'Ключ неверный или уже активирован' });
       }
       const k = del.rows[0];
       const hours = Math.round(Number(k.duration_hours) || 0);
-      if (!(hours > 0)) return res.json({ ok: false, message: 'У ключа нет срока' });
+      if (!(hours > 0)) return reply(req, res, deviceId, { ok: false, active: false, message: 'У ключа нет срока' });
 
       const status = await readStatus(deviceId);
       const from = status.active && status.expires ? new Date(status.expires) : new Date();
@@ -107,7 +126,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
          SET cancel_key = $2, cancel_expires = $3, last_seen = NOW()`,
         [deviceId, key, expires, k.type || 'Отмена']
       );
-      res.json({ ok: true, expires: expires.toISOString(), hours_left: Math.round(hours), type: k.type || '' });
+      reply(req, res, deviceId, { ok: true, active: true, expires: expires.toISOString(), hours_left: Math.round(hours), type: k.type || '' });
     } catch (err) {
       console.error('cancel activate error:', err);
       res.status(500).json({ ok: false, message: 'Ошибка базы данных' });

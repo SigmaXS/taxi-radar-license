@@ -3,7 +3,12 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
+const guard = require('./guard');
+const signing = require('./signing');
+
 const app = express();
+// Railway ставит один прокси перед приложением: берём IP клиента из X-Forwarded-For.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 // API вызывает Android-приложение, а не браузер, — CORS нужен только ему.
@@ -157,6 +162,10 @@ function requireAdmin(req, res, next) {
 
   const header = req.headers.authorization || '';
   const [scheme, encoded] = header.split(' ');
+  const failKey = 'adminfail:' + guard.clientIp(req);
+  if (guard.isBlocked(failKey, 8, 15 * 60 * 1000)) {
+    return res.status(429).send('Слишком много неверных попыток входа. Подождите 15 минут.');
+  }
   if (scheme === 'Basic' && encoded) {
     const decoded = Buffer.from(encoded, 'base64').toString('utf8');
     const sep = decoded.indexOf(':');
@@ -173,9 +182,18 @@ function requireAdmin(req, res, next) {
       }
       return next();
     }
+    // Неверный логин или пароль (а не просто первый запрос браузера без пароля).
+    guard.record(failKey, 15 * 60 * 1000);
   }
   res.set('WWW-Authenticate', 'Basic realm="Taxi Radar admin", charset="UTF-8"');
   return res.status(401).send('Требуется вход');
+}
+
+// Ответ о лицензии: срок в ISO и подпись (см. signing.js). Приложение 2.5+ принимает «valid:true» только с ней.
+function sendLicense(req, res, kind, deviceId, body) {
+  const out = { ...body };
+  if (out.expires) out.expires = new Date(out.expires).toISOString();
+  res.json(signing.signed(req, kind, deviceId, out.valid === true, out.expires || '', out));
 }
 
 app.use('/admin', requireAdmin);
@@ -271,6 +289,9 @@ app.get('/api/app-config', (req, res) => {
       'Новое: цена заказа точнее (адрес до дома, без лишних остановок, пробки по поездкам всех водителей); карта как мини-Waze — отмечайте радары и полицию кнопкой «+» на кружке, предупреждение за 400 и 100 м; поиск адреса на карте; исправлены уведомления на Xiaomi.',
     // Тарифы на экране «Подписка»: JSON вида [{"days":30,"price":99}]
     tariffs: parseTariffs(),
+    // Тарифы «Отмены» (дни и цена) и пакет «Радар + Отмена»: чем дольше срок, тем дешевле день.
+    cancel_tariffs: require('./plans').cancelTariffs(),
+    bundle_price: require('./plans').bundlePrice(),
     currency: process.env.CURRENCY || 'лей',
     surge_base: surgeBase(),
     // Загруженный на /admin/apk файл: версия, «что нового» и ссылка на скачивание.
@@ -480,7 +501,7 @@ app.post('/api/referral/apply', async (req, res) => {
 });
 
 // 1. Запрос триала на 7 дней — один раз на устройство, по времени сервера
-app.post('/api/request-trial', async (req, res) => {
+app.post('/api/request-trial', guard.limitIp('trial', 60, 3600 * 1000), async (req, res) => {
   const { device_id } = req.body;
   if (!isValidDeviceId(device_id)) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
   const deviceInfo = cleanDeviceInfo(req.body.device_info);
@@ -491,20 +512,23 @@ app.post('/api/request-trial', async (req, res) => {
       const dev = devQuery.rows[0];
       await pool.query('UPDATE devices SET device_info = COALESCE($1, device_info) WHERE device_id = $2', [deviceInfo, device_id]);
       if (dev.status === 'banned') {
-        return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано (БАН)!" });
+        return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано (БАН)!" });
       }
       const isExpired = new Date(dev.expires).getTime() < Date.now();
       if (isExpired) {
-        return res.json({ valid: false, force_lock: true, is_banned: false, message: "Пробный период завершен. Введите ключ." });
+        return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, is_banned: false, message: "Пробный период завершен. Введите ключ." });
       }
-      return res.json({ valid: true, force_lock: false, expires: dev.expires, message: "Пробный период активен" });
+      return sendLicense(req, res, 'radar', device_id, { valid: true, force_lock: false, expires: dev.expires, message: "Пробный период активен" });
     }
 
     const trialCheck = await pool.query('SELECT * FROM trial_history WHERE device_id = $1', [device_id]);
     if (trialCheck.rows.length > 0) {
-      return res.json({ valid: false, force_lock: true, message: "Пробный период на этом устройстве уже был использован. Введите ключ." });
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, message: "Пробный период на этом устройстве уже был использован. Введите ключ." });
     }
 
+    if (guard.tooMany('trialnew:' + guard.clientIp(req), parseInt(process.env.TRIAL_PER_IP_DAY || '30', 10), 24 * 3600 * 1000)) {
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, message: "С этого подключения уже много новых устройств. Напишите нам — поможем." });
+    }
     const expireDate = new Date(Date.now() + TRIAL_HOURS * 3600 * 1000);
     const trialKey = generateCode("TR7D");
 
@@ -514,7 +538,7 @@ app.post('/api/request-trial', async (req, res) => {
     );
     await pool.query('INSERT INTO trial_history (device_id) VALUES ($1) ON CONFLICT DO NOTHING', [device_id]);
 
-    return res.json({
+    return sendLicense(req, res, 'radar', device_id, {
       valid: true,
       force_lock: false,
       message: "Активирован бесплатный доступ на 7 дней!",
@@ -527,26 +551,31 @@ app.post('/api/request-trial', async (req, res) => {
 });
 
 // 2. Активация ключа
-app.post('/api/activate-device', async (req, res) => {
+app.post('/api/activate-device', guard.limitIp('activate', 60, 3600 * 1000), async (req, res) => {
   const { key, device_id } = req.body;
   if (typeof key !== 'string' || !key.trim() || !isValidDeviceId(device_id)) {
     return res.status(400).json({ valid: false, force_lock: true, message: "Введите ключ и ID" });
   }
 
   const cleanKey = key.trim().toUpperCase();
+  if (guard.isBlocked('badkey:' + device_id, 10, 3600 * 1000) || guard.isBlocked('badkeyip:' + guard.clientIp(req), 60, 3600 * 1000)) {
+    return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: false, message: "Слишком много неверных ключей. Подождите час." });
+  }
   const deviceInfo = cleanDeviceInfo(req.body.device_info);
 
   try {
     const devCheck = await pool.query('SELECT * FROM devices WHERE device_id = $1', [device_id]);
     if (devCheck.rows.length > 0 && devCheck.rows[0].status === 'banned') {
-      return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство в бане!" });
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, is_banned: true, message: "Устройство в бане!" });
     }
 
     // Удаляем ключ в том же запросе, что и читаем: два устройства не смогут
     // активировать один ключ одновременно.
     const keyQuery = await pool.query("DELETE FROM app_keys WHERE key_code = $1 AND product = 'radar' RETURNING *", [cleanKey]);
     if (keyQuery.rows.length === 0) {
-      return res.json({ valid: false, force_lock: true, message: "Неверный ключ или уже активирован" });
+      guard.record('badkey:' + device_id, 3600 * 1000);
+      guard.record('badkeyip:' + guard.clientIp(req), 3600 * 1000);
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, message: "Неверный ключ или уже активирован" });
     }
     const keyData = keyQuery.rows[0];
 
@@ -572,7 +601,7 @@ app.post('/api/activate-device', async (req, res) => {
       }
     }
 
-    return res.json({
+    return sendLicense(req, res, 'radar', device_id, {
       valid: true,
       force_lock: false,
       message: `Успешно! Доступ открыт (${keyData.type})`,
@@ -585,14 +614,14 @@ app.post('/api/activate-device', async (req, res) => {
 });
 
 // 3. Проверка при входе в приложение и фоновая — по времени сервера
-app.post('/api/check-license', async (req, res) => {
+app.post('/api/check-license', guard.limitIp('check', 600, 3600 * 1000), async (req, res) => {
   const { device_id } = req.body;
   if (!isValidDeviceId(device_id)) return res.status(400).json({ valid: false, force_lock: true, message: "Нет ID" });
 
   try {
     const devQuery = await pool.query('SELECT * FROM devices WHERE device_id = $1', [device_id]);
     if (devQuery.rows.length === 0) {
-      return res.json({ valid: false, force_lock: true, message: "Устройство не найдено" });
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, message: "Устройство не найдено" });
     }
     const dev = devQuery.rows[0];
 
@@ -605,20 +634,20 @@ app.post('/api/check-license', async (req, res) => {
       [device_id]).catch(() => {});
 
     if (dev.status === 'banned') {
-      return res.json({ valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано" });
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, is_banned: true, message: "Устройство заблокировано" });
     }
     if (dev.status === 'disabled') {
-      return res.json({ valid: false, force_lock: true, is_banned: false, message: "Подписка отключена. Введите ключ." });
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, is_banned: false, message: "Подписка отключена. Введите ключ." });
     }
 
     const expireDate = new Date(dev.expires);
 
     if (serverNow > expireDate) {
-      return res.json({ valid: false, force_lock: true, is_banned: false, message: "Срок действия подписки истек" });
+      return sendLicense(req, res, 'radar', device_id, { valid: false, force_lock: true, is_banned: false, message: "Срок действия подписки истек" });
     }
 
     const diffHours = Math.max(0, Math.round((expireDate - serverNow) / 3600000));
-    return res.json({ valid: true, force_lock: false, expires: dev.expires, hours_left: diffHours });
+    return sendLicense(req, res, 'radar', device_id, { valid: true, force_lock: false, expires: dev.expires, hours_left: diffHours });
   } catch (err) {
     console.error(err);
     res.status(500).json({ valid: false, force_lock: true, message: "Ошибка базы данных" });
