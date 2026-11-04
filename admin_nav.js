@@ -9,8 +9,8 @@ const TABS = [
   ['/admin/messages', '📣 Сообщения'],
   ['/admin/weekly', '📊 Сводка'],
   ['/admin/crashes', '🐞 Ошибки'],
-  ['/admin/apk', '⬆️ Обновление']
-  ['/admin/cancel', 'Отмена'],
+  ['/admin/apk', '⬆️ Обновление'],
+  ['/admin/cancel', '🚫 Отмена'],
 ];
 
 function adminNav(active) {
