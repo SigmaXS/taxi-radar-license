@@ -544,7 +544,7 @@ app.post('/api/activate-device', async (req, res) => {
 
     // Удаляем ключ в том же запросе, что и читаем: два устройства не смогут
     // активировать один ключ одновременно.
-    const keyQuery = await pool.query('DELETE FROM app_keys WHERE key_code = $1 RETURNING *', [cleanKey]);
+    const keyQuery = await pool.query("DELETE FROM app_keys WHERE key_code = $1 AND product = 'radar' RETURNING *", [cleanKey]);
     if (keyQuery.rows.length === 0) {
       return res.json({ valid: false, force_lock: true, message: "Неверный ключ или уже активирован" });
     }
