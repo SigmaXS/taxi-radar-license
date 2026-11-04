@@ -19,7 +19,13 @@ function privateKey() {
     return null;
   }
   try {
-    key = crypto.createPrivateKey(raw.replace(/\\n/g, '\n'));
+    let pem = raw.replace(/\\n/g, '\n').trim();
+    // Допускаем ключ и без строк BEGIN/END (одним куском или в несколько строк).
+    if (!pem.includes('BEGIN')) {
+      const body = pem.replace(/\s+/g, '');
+      pem = '-----BEGIN PRIVATE KEY-----\n' + (body.match(/.{1,64}/g) || []).join('\n') + '\n-----END PRIVATE KEY-----';
+    }
+    key = crypto.createPrivateKey(pem);
   } catch (e) {
     console.error('LICENSE_SIGN_KEY не читается:', e.message);
   }
