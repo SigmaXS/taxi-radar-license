@@ -88,7 +88,7 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
       const base = 'https://' + req.get('host');
       const text = [
         `💰 Оплата подписки №${id}`,
-        `${tariff.price} ${process.env.CURRENCY || 'лей'} · ${tariff.days} дн. — проверьте перевод MIA`,
+        `${tariff.price} ${process.env.CURRENCY || 'лей'} · ${tariff.days} дн.${product === 'cancel' ? ' · «Отмена»' : product === 'both' ? ' · Радар + Отмена' : ''}${product === 'cancel' && tariff.days >= 30 ? ' (+ радар в подарок)' : ''} — проверьте перевод MIA`,
         `📞 ${phone}`,
         promo ? `Промокод: ${promo}` : null,
         info ? `📱 ${info}` : null,
@@ -121,7 +121,8 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
   });
 
   async function extend(claim) {
-    if (claim.product === 'both') {
+    // Месяц «Отмены» и больше — радар на тот же срок в подарок (как пакет «Радар + Отмена»).
+    if (claim.product === 'both' || (claim.product === 'cancel' && claim.days >= 30)) {
       const r = await pool.query(
         `INSERT INTO devices (device_id, expires, cancel_expires, last_seen, status, type)
          VALUES ($1, NOW() + ($2 || ' days')::INTERVAL, NOW() + ($2 || ' days')::INTERVAL, NOW(), 'active', $3)
@@ -131,7 +132,7 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
            status = CASE WHEN devices.status = 'banned' THEN devices.status ELSE 'active' END,
            last_seen = NOW()
          RETURNING expires, status`,
-        [claim.device_id, String(claim.days), `MIA ${claim.price} L, Радар + Отмена ${claim.days} дн.`]
+        [claim.device_id, String(claim.days), `MIA ${claim.price} L, Отмена ${claim.days} дн. + радар в подарок`]
       );
       try { await rewardReferrer(claim.device_id); } catch (e) { console.error('Referral reward error:', e); }
       return r.rows[0];
