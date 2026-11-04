@@ -77,7 +77,7 @@ document.getElementById('f').onsubmit = async e => {
 
   app.post('/admin/apk', express.raw({ type: 'application/octet-stream', limit: '40mb' }), async (req, res) => {
     const code = parseInt(req.query.code, 10);
-    const name = String(req.query.name || '').trim().slice(0, 20);
+    const name = String(req.query.name || '').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 20);
     const notes = String(req.query.notes || '').trim().slice(0, 3000);
     const data = req.body;
     if (!Buffer.isBuffer(data) || data.length < 100000) return res.status(400).send('Нет файла');
@@ -126,12 +126,14 @@ document.getElementById('f').onsubmit = async e => {
       const file = await apkFile(latest.sha256);
       if (!file) return res.status(404).send('Нет файла');
       res.set('Content-Type', 'application/vnd.android.package-archive');
-      res.set('Content-Disposition', `attachment; filename="TaxiRadar-${file.name}.apk"`);
+      // В имени версии бывают пробел, перевод строки или кириллица — в заголовок годятся только латиница, цифры, точка и дефис.
+      const safe = String(file.name).replace(/[^A-Za-z0-9._-]/g, '') || 'update';
+      res.set('Content-Disposition', `attachment; filename="TaxiRadar-${safe}.apk"`);
       res.set('Content-Length', String(file.data.length));
       res.end(file.data);
     } catch (e) {
       console.error('apk download error:', e.message);
-      if (!res.headersSent) res.status(500).send('Ошибка сервера, попробуйте ещё раз [' + String(e.message).slice(0, 120) + ']');
+      if (!res.headersSent) res.status(500).send('Ошибка сервера, попробуйте ещё раз');
     }
   });
 }
