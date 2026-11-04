@@ -1,9 +1,9 @@
-// Тарифы «Отмены»: дни:цена через запятую в CANCEL_TARIFFS (Railway), по умолчанию 3:249,7:449,30:999.
-// Чем длиннее срок, тем дешевле день (83 → 64 → 33 лей), поэтому выгоднее всего месяц.
+// Тарифы «Отмены»: дни:цена через запятую в CANCEL_TARIFFS (Railway), по умолчанию 3:250,7:450,30:999.
+// Чем длиннее срок, тем дешевле день (83 → 64 → 33 лея), поэтому выгоднее всего месяц.
 // Пакет «Радар + Отмена» — 30 дней, цена в BUNDLE_PRICE (по умолчанию 999).
 
 function cancelTariffs() {
-  const raw = process.env.CANCEL_TARIFFS || '3:249,7:449,30:999';
+  const raw = process.env.CANCEL_TARIFFS || '3:250,7:450,30:999';
   const list = raw.split(',').map(p => {
     const [d, pr] = p.split(':').map(x => parseInt(String(x).trim(), 10));
     return { days: d, price: pr };
