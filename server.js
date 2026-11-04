@@ -192,6 +192,9 @@ require('./weekly')(app, pool, { escapeHtml, latestVersion: updates.latestVersio
 // Оплата переводом MIA: «Я оплатил» → Telegram админу → «✓ Пришло» продлевает подписку (/admin/payments).
 const payments = require('./payments')(app, pool, { isValidDeviceId, escapeHtml, parseTariffs, rewardReferrer });
 
+// «Отмена» — отдельный продукт: свой тест, ключи и подписка.
+require('./cancel')(app, pool, { isValidDeviceId, escapeHtml, generateCode, adminNav: require('./admin_nav').adminNav });
+
 app.get('/', (req, res) => res.send('Taxi Radar License Server is running.'));
 
 // Ссылка-приглашение: кнопка скачать APK и код друга, который ввести при первом запуске.

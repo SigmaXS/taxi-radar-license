@@ -19,6 +19,7 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
       phone VARCHAR(20) NOT NULL,
       promo VARCHAR(30),
       device_info VARCHAR(150),
+      product VARCHAR(20) NOT NULL DEFAULT 'radar',
       status VARCHAR(12) NOT NULL DEFAULT 'new',
       created TIMESTAMP NOT NULL DEFAULT NOW(),
       decided TIMESTAMP
@@ -62,7 +63,10 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
     if (!isValidDeviceId(b.device_id)) return res.status(400).json({ ok: false, message: 'Нет ID' });
     const phone = String(b.phone || '').replace(/[^\d+]/g, '').slice(0, 16);
     if (phone.replace(/\D/g, '').length < 8) return res.json({ ok: false, message: 'Укажите свой номер телефона' });
-    const tariff = parseTariffs().find(t => t.days === parseInt(b.days, 10));
+    const product = b.product === 'cancel' ? 'cancel' : 'radar';
+    const tariff = product === 'cancel'
+      ? { days: 30, price: Number(process.env.CANCEL_PRICE || 999) }
+      : parseTariffs().find(t => t.days === parseInt(b.days, 10));
     if (!tariff) return res.json({ ok: false, message: 'Тариф не найден, обновите экран' });
     // Не чаще раза в 2 минуты с одного телефона (двойное нажатие, повторы).
     const last = recent.get(b.device_id) || 0;
@@ -74,8 +78,8 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
       const promo = String(b.promo || '').replace(/[^\p{L}\p{N}_-]/gu, '').slice(0, 30) || null;
       const info = typeof b.device_info === 'string' ? b.device_info.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 150) : null;
       const r = await pool.query(
-        'INSERT INTO pay_claims (device_id, days, price, phone, promo, device_info) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created',
-        [b.device_id, tariff.days, tariff.price, phone, promo, info]
+        'INSERT INTO pay_claims (device_id, days, price, phone, promo, device_info, product) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created',
+        [b.device_id, tariff.days, tariff.price, phone, promo, info, product]
       );
       const id = Number(r.rows[0].id);
       const dev = (await pool.query('SELECT expires, status FROM devices WHERE device_id = $1', [b.device_id])).rows[0];
@@ -115,6 +119,18 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
   });
 
   async function extend(claim) {
+    if (claim.product === 'cancel') {
+      const r = await pool.query(
+        `INSERT INTO devices (device_id, cancel_expires, last_seen, status, type)
+         VALUES ($1, NOW() + ($2 || ' days')::INTERVAL, NOW(), 'active', $3)
+         ON CONFLICT (device_id) DO UPDATE SET
+           cancel_expires = CASE WHEN devices.cancel_expires > NOW() THEN devices.cancel_expires ELSE NOW() END + ($2 || ' days')::INTERVAL,
+           last_seen = NOW()
+         RETURNING cancel_expires AS expires, status`,
+        [claim.device_id, String(claim.days), `MIA ${claim.price} L, Отмена ${claim.days} дн.`]
+      );
+      return r.rows[0];
+    }
     const r = await pool.query(
       `INSERT INTO devices (device_id, key_code, expires, last_seen, status, type)
        VALUES ($1, NULL, NOW() + ($2 || ' days')::INTERVAL, NOW(), 'active', $3)
