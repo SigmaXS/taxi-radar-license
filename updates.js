@@ -101,13 +101,21 @@ document.getElementById('f').onsubmit = async e => {
   function apkFile(sha) {
     if (cached && cached.sha === sha) return Promise.resolve(cached);
     if (loading && loading.sha === sha) return loading.promise;
-    const promise = pool.query('SELECT data, version_name FROM app_builds WHERE sha256 = $1 ORDER BY id DESC LIMIT 1', [sha])
-      .then(r => {
-        const row = r.rows[0];
-        cached = row ? { sha, name: row.version_name, data: row.data } : null;
-        return cached;
-      })
-      .finally(() => { if (loading && loading.sha === sha) loading = null; });
+    // Куски по 1 МБ: целиком 25 МБ одним ответом база отдаёт в виде строки ×2 по размеру — серверу не хватало памяти.
+    const promise = (async () => {
+      const head = await pool.query('SELECT id, version_name, size FROM app_builds WHERE sha256 = $1 ORDER BY id DESC LIMIT 1', [sha]);
+      const row = head.rows[0];
+      if (!row) return (cached = null);
+      const parts = [];
+      const CHUNK = 1024 * 1024;
+      for (let from = 1; from <= row.size; from += CHUNK) {
+        const piece = await pool.query('SELECT substring(data from $2::int for $3::int) AS part FROM app_builds WHERE id = $1', [row.id, from, CHUNK]);
+        parts.push(piece.rows[0].part);
+      }
+      const data = Buffer.concat(parts);
+      if (data.length !== row.size) throw new Error('apk size mismatch: ' + data.length + ' vs ' + row.size);
+      return (cached = { sha, name: row.version_name, data });
+    })().finally(() => { if (loading && loading.sha === sha) loading = null; });
     loading = { sha, promise };
     return promise;
   }
