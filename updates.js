@@ -93,14 +93,38 @@ document.getElementById('f').onsubmit = async e => {
     res.send(`Готово: ${name} (${code}) загружена, водители увидят обновление.`);
   });
 
+  // Файл читаем из базы один раз и раздаём из памяти. Раньше каждый запрос тянул 25 МБ из базы заново
+  // (с разворотом в текст ×2): когда водители обновлялись разом, серверу не хватало памяти, он падал
+  // и перезапускался — отвечал 502 и на скачивание, и на проверку лицензии.
+  let cached = null;   // { sha, name, data }
+  let loading = null;  // { sha, promise }
+  function apkFile(sha) {
+    if (cached && cached.sha === sha) return Promise.resolve(cached);
+    if (loading && loading.sha === sha) return loading.promise;
+    const promise = pool.query('SELECT data, version_name FROM app_builds WHERE sha256 = $1 ORDER BY id DESC LIMIT 1', [sha])
+      .then(r => {
+        const row = r.rows[0];
+        cached = row ? { sha, name: row.version_name, data: row.data } : null;
+        return cached;
+      })
+      .finally(() => { if (loading && loading.sha === sha) loading = null; });
+    loading = { sha, promise };
+    return promise;
+  }
+
   app.get('/download/taxiradar.apk', async (req, res) => {
     if (!latest) return res.status(404).send('Нет файла');
-    const r = await pool.query('SELECT data, version_name FROM app_builds WHERE sha256 = $1 ORDER BY id DESC LIMIT 1', [latest.sha256]);
-    if (!r.rows[0]) return res.status(404).send('Нет файла');
-    res.set('Content-Type', 'application/vnd.android.package-archive');
-    res.set('Content-Disposition', `attachment; filename="TaxiRadar-${r.rows[0].version_name}.apk"`);
-    res.set('Content-Length', String(r.rows[0].data.length));
-    res.end(r.rows[0].data);
+    try {
+      const file = await apkFile(latest.sha256);
+      if (!file) return res.status(404).send('Нет файла');
+      res.set('Content-Type', 'application/vnd.android.package-archive');
+      res.set('Content-Disposition', `attachment; filename="TaxiRadar-${file.name}.apk"`);
+      res.set('Content-Length', String(file.data.length));
+      res.end(file.data);
+    } catch (e) {
+      console.error('apk download error:', e.message);
+      if (!res.headersSent) res.status(500).send('Ошибка сервера, попробуйте ещё раз');
+    }
   });
 }
 

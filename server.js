@@ -4,6 +4,10 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const guard = require('./guard');
+
+// Ошибка в одном запросе не должна ронять весь сервер (иначе все водители получают 502).
+process.on('unhandledRejection', e => console.error('unhandledRejection:', e && e.stack || e));
+process.on('uncaughtException', e => console.error('uncaughtException:', e && e.stack || e));
 const signing = require('./signing');
 
 const app = express();
