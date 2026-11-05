@@ -16,6 +16,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_expires TIMESTAMP;
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_trial_at TIMESTAMP;
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_banned BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_active_at TIMESTAMP;
   `).catch(err => console.error('cancel schema error:', err));
 
   const nowIso = d => (d ? new Date(d).toISOString() : null);
@@ -51,6 +52,10 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     const deviceId = req.body && req.body.device_id;
     if (!isValidDeviceId(deviceId)) return res.status(400).json({ ok: false, message: 'Нет ID' });
     try {
+      // Приложение раз в минуту шлёт running:true, пока скрипт «Отмена» включён: так видно, кто работает сейчас.
+      if (req.body.running === true) {
+        pool.query('UPDATE devices SET cancel_active_at = NOW() WHERE device_id = $1 AND cancel_banned = FALSE', [deviceId]).catch(() => {});
+      }
       reply(req, res, deviceId, { ok: true, ...(await readStatus(deviceId)) });
     } catch (err) {
       console.error('cancel status error:', err);
@@ -147,7 +152,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
         "SELECT * FROM app_keys WHERE product = 'cancel' ORDER BY created DESC NULLS LAST LIMIT 200"
       )).rows;
       const all = (await pool.query(
-        `SELECT device_id, device_info, cancel_key, cancel_expires, cancel_trial_at, cancel_banned
+        `SELECT device_id, device_info, cancel_key, cancel_expires, cancel_trial_at, cancel_banned, cancel_active_at
          FROM devices WHERE cancel_expires IS NOT NULL OR cancel_trial_at IS NOT NULL OR cancel_banned
          ORDER BY cancel_expires DESC NULLS LAST`
       )).rows;
@@ -158,6 +163,10 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
       const bannedN = all.filter(s => s.cancel_banned).length;
       const trialN = all.filter(s => s.cancel_trial_at).length;
       const expiredN = all.length - activeN - bannedN;
+      // «Работает сейчас»: пинг не старше 3 минут (приложение шлёт раз в минуту, пока скрипт включён).
+      const runningNow = s => !s.cancel_banned && s.cancel_active_at && now - new Date(s.cancel_active_at) < 3 * 60000;
+      const runningN = all.filter(runningNow).length;
+      const dayAgo = all.filter(s => s.cancel_active_at && now - new Date(s.cancel_active_at) < 24 * 3600000).length;
 
       let subs = all;
       if (q) {
@@ -180,9 +189,12 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
         const status = s.cancel_banned
           ? '<b style="color:#e53e3e;">🚫 В БАНЕ</b>'
           : act ? '<b style="color:#2f855a;">✅ Активна</b>' : '<span style="color:#718096;">⏳ Истекла</span>';
+        const live = runningNow(s)
+          ? '<br><b style="color:#2f855a;">🟢 скрипт работает</b>'
+          : (s.cancel_active_at ? `<br><span style="font-size:12px;color:#718096;">был ${fmt(s.cancel_active_at)}</span>` : '');
         const left = act ? `<br><span style="font-size:12px;font-weight:bold;color:#b7791f;">осталось ${Math.max(0, Math.floor((new Date(s.cancel_expires) - now) / 86400000))} дн.</span>` : '';
         return `<tr style="${act ? 'background:#fffff0;' : ''}">
-          <td style="white-space:nowrap;">${status}</td>
+          <td style="white-space:nowrap;">${status}${live}</td>
           <td><div style="font-weight:bold;">${escapeHtml(s.cancel_key || '—')}</div><div style="font-size:12px;color:#718096;">${s.cancel_trial_at ? 'тест ' + fmt(s.cancel_trial_at) : ''}</div></td>
           <td><div style="font-weight:600;">${s.device_info ? escapeHtml(s.device_info) : '<span style="color:#a0aec0;">—</span>'}</div>
             <code style="background:#feebc8;color:#c05621;padding:2px 6px;border-radius:4px;font-size:12px;">${escapeHtml(s.device_id)}</code></td>
@@ -218,6 +230,8 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
           <h2>🚫 «Отмена» — статистика</h2>
           ${req.query.msg ? `<p style="font-weight:bold;background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
           <div class="stats-grid">
+            <div class="stat-box" style="border-color:#9ae6b4;background:#f0fff4;"><div>🟢 Работают сейчас</div><div class="stat-num" style="color:#2f855a;">${runningN}</div></div>
+            <div class="stat-box"><div>За 24 часа</div><div class="stat-num">${dayAgo}</div></div>
             <div class="stat-box"><div>Всего устройств</div><div class="stat-num">${all.length}</div></div>
             <div class="stat-box"><div>✅ Активных</div><div class="stat-num" style="color:#3182ce;">${activeN}</div></div>
             <div class="stat-box"><div>⏳ Истекли</div><div class="stat-num" style="color:#718096;">${expiredN}</div></div>
