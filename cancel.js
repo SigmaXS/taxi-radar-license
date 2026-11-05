@@ -54,12 +54,16 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     if (!isValidDeviceId(deviceId)) return res.status(400).json({ ok: false, message: 'Нет ID' });
     try {
       // Приложение раз в минуту шлёт running:true, пока скрипт «Отмена» включён: так видно, кто работает сейчас.
+      let ping;
       if (req.body.running === true) {
         // runs — сколько раз скрипт сработал на этом телефоне (только растёт).
         const runs = Math.max(0, Math.min(10000000, parseInt(req.body.runs, 10) || 0));
-        pool.query('UPDATE devices SET cancel_active_at = NOW(), cancel_runs = GREATEST(cancel_runs, $2) WHERE device_id = $1 AND cancel_banned = FALSE', [deviceId, runs]).catch(() => {});
+        try {
+          const u = await pool.query('UPDATE devices SET cancel_active_at = NOW(), cancel_runs = GREATEST(cancel_runs, $2::int) WHERE device_id = $1 AND cancel_banned = FALSE', [deviceId, runs]);
+          ping = u.rowCount; // 1 — записано; 0 — такого устройства нет в базе
+        } catch (e) { console.error('cancel ping error:', e.message); ping = -1; }
       }
-      reply(req, res, deviceId, { ok: true, ...(await readStatus(deviceId)) });
+      reply(req, res, deviceId, { ok: true, ...(await readStatus(deviceId)), ...(ping !== undefined ? { ping } : {}) });
     } catch (err) {
       console.error('cancel status error:', err);
       res.status(500).json({ ok: false, message: 'Ошибка базы данных' });
