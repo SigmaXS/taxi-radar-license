@@ -18,6 +18,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_banned BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_active_at TIMESTAMP;
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_runs INT NOT NULL DEFAULT 0;
+    ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_seen_at TIMESTAMP;
   `).catch(err => console.error('cancel schema error:', err));
 
   const nowIso = d => (d ? new Date(d).toISOString() : null);
@@ -54,6 +55,9 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     if (!isValidDeviceId(deviceId)) return res.status(400).json({ ok: false, message: 'Нет ID' });
     try {
       // Приложение раз в минуту шлёт running:true, пока скрипт «Отмена» включён: так видно, кто работает сейчас.
+      // Любое обращение приложения «Отмены» — «на связи». Приложения 2.5.x, пока скрипт включён, спрашивают сервер раз в минуту
+      // и без нашей новой отметки, так что видны и те, кто ещё не обновился.
+      pool.query('UPDATE devices SET cancel_seen_at = NOW() WHERE device_id = $1', [deviceId]).catch(() => {});
       let ping;
       if (req.body.running === true) {
         // runs — сколько раз скрипт сработал на этом телефоне (только растёт).
@@ -159,7 +163,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
         "SELECT * FROM app_keys WHERE product = 'cancel' ORDER BY created DESC NULLS LAST LIMIT 200"
       )).rows;
       const all = (await pool.query(
-        `SELECT device_id, device_info, cancel_key, cancel_expires, cancel_trial_at, cancel_banned, cancel_active_at, cancel_runs
+        `SELECT device_id, device_info, cancel_key, cancel_expires, cancel_trial_at, cancel_banned, cancel_active_at, cancel_runs, cancel_seen_at
          FROM devices WHERE cancel_expires IS NOT NULL OR cancel_trial_at IS NOT NULL OR cancel_banned
          ORDER BY cancel_expires DESC NULLS LAST`
       )).rows;
@@ -172,7 +176,8 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
       const expiredN = all.length - activeN - bannedN;
       // «Работает сейчас»: пинг не старше 3 минут (приложение шлёт раз в минуту, пока скрипт включён).
       const runningNow = s => !s.cancel_banned && s.cancel_active_at && now - new Date(s.cancel_active_at) < 3 * 60000;
-      const runningN = all.filter(runningNow).length;
+      const onlineNow = s => !s.cancel_banned && s.cancel_seen_at && now - new Date(s.cancel_seen_at) < 3 * 60000;
+      const runningN = all.filter(s => runningNow(s) || onlineNow(s)).length;
       const dayAgo = all.filter(s => s.cancel_active_at && now - new Date(s.cancel_active_at) < 24 * 3600000).length;
 
       let subs = all;
@@ -196,9 +201,12 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
         const status = s.cancel_banned
           ? '<b style="color:#e53e3e;">🚫 В БАНЕ</b>'
           : act ? '<b style="color:#2f855a;">✅ Активна</b>' : '<span style="color:#718096;">⏳ Истекла</span>';
+        const lastAny = [s.cancel_active_at, s.cancel_seen_at].filter(Boolean).map(x => new Date(x)).sort((a, b) => b - a)[0];
         const live = runningNow(s)
           ? '<br><b style="color:#2f855a;">🟢 скрипт работает</b>'
-          : (s.cancel_active_at ? `<br><span style="font-size:12px;color:#718096;">был ${fmt(s.cancel_active_at)}</span>` : '');
+          : onlineNow(s)
+            ? '<br><b style="color:#2f855a;">🟢 онлайн</b>'
+            : (lastAny ? `<br><span style="font-size:12px;color:#718096;">был ${fmt(lastAny)}</span>` : '');
         const runsHtml = s.cancel_runs > 0 ? `<br><span style="font-size:12px;color:#4a5568;">сработала ${s.cancel_runs} раз</span>` : '';
         const left = act ? `<br><span style="font-size:12px;font-weight:bold;color:#b7791f;">осталось ${Math.max(0, Math.floor((new Date(s.cancel_expires) - now) / 86400000))} дн.</span>` : '';
         return `<tr style="${act ? 'background:#fffff0;' : ''}">
@@ -238,7 +246,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
           <h2>🚫 «Отмена» — статистика</h2>
           ${req.query.msg ? `<p style="font-weight:bold;background:#ebf8ff;padding:10px;border-radius:6px;">${escapeHtml(req.query.msg)}</p>` : ''}
           <div class="stats-grid">
-            <div class="stat-box" style="border-color:#9ae6b4;background:#f0fff4;"><div>🟢 Работают сейчас</div><div class="stat-num" style="color:#2f855a;">${runningN}</div></div>
+            <div class="stat-box" style="border-color:#9ae6b4;background:#f0fff4;"><div>🟢 Онлайн сейчас</div><div class="stat-num" style="color:#2f855a;">${runningN}</div></div>
             <div class="stat-box"><div>За 24 часа</div><div class="stat-num">${dayAgo}</div></div>
             <div class="stat-box"><div>Всего устройств</div><div class="stat-num">${all.length}</div></div>
             <div class="stat-box"><div>✅ Активных</div><div class="stat-num" style="color:#3182ce;">${activeN}</div></div>
