@@ -378,6 +378,15 @@ async function rewardReferrer(deviceId, onPurchase = true) {
        WHERE device_id = $1`, [ref.device_id, Math.max(0, debt - days), give]);
     // Сколько начислили именно за код — столько и снимем, если друг не станет пользоваться.
     if (!onPurchase) await client.query('UPDATE referrals SET bonus_days = $2 WHERE device_id = $1', [deviceId, give]);
+    // «Отмена»: за приглашение по +1 дню и пригласившему, и другу (CANCEL_REFERRAL_DAYS, 0 — выключить).
+    if (!onPurchase) {
+      const cd = parseInt(process.env.CANCEL_REFERRAL_DAYS || '1', 10);
+      if (Number.isFinite(cd) && cd > 0) {
+        await client.query(
+          `UPDATE devices SET cancel_expires = GREATEST(COALESCE(cancel_expires, NOW()), NOW()) + ($2 || ' days')::INTERVAL
+            WHERE device_id = ANY($1::text[]) AND cancel_banned = FALSE`, [[ref.device_id, deviceId], String(cd)]);
+      }
+    }
     await client.query('COMMIT');
     return true;
   } catch (e) {

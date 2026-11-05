@@ -17,6 +17,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_trial_at TIMESTAMP;
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_banned BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_active_at TIMESTAMP;
+    ALTER TABLE devices ADD COLUMN IF NOT EXISTS cancel_runs INT NOT NULL DEFAULT 0;
   `).catch(err => console.error('cancel schema error:', err));
 
   const nowIso = d => (d ? new Date(d).toISOString() : null);
@@ -54,7 +55,9 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
     try {
       // Приложение раз в минуту шлёт running:true, пока скрипт «Отмена» включён: так видно, кто работает сейчас.
       if (req.body.running === true) {
-        pool.query('UPDATE devices SET cancel_active_at = NOW() WHERE device_id = $1 AND cancel_banned = FALSE', [deviceId]).catch(() => {});
+        // runs — сколько раз скрипт сработал на этом телефоне (только растёт).
+        const runs = Math.max(0, Math.min(10000000, parseInt(req.body.runs, 10) || 0));
+        pool.query('UPDATE devices SET cancel_active_at = NOW(), cancel_runs = GREATEST(cancel_runs, $2) WHERE device_id = $1 AND cancel_banned = FALSE', [deviceId, runs]).catch(() => {});
       }
       reply(req, res, deviceId, { ok: true, ...(await readStatus(deviceId)) });
     } catch (err) {
@@ -152,7 +155,7 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
         "SELECT * FROM app_keys WHERE product = 'cancel' ORDER BY created DESC NULLS LAST LIMIT 200"
       )).rows;
       const all = (await pool.query(
-        `SELECT device_id, device_info, cancel_key, cancel_expires, cancel_trial_at, cancel_banned, cancel_active_at
+        `SELECT device_id, device_info, cancel_key, cancel_expires, cancel_trial_at, cancel_banned, cancel_active_at, cancel_runs
          FROM devices WHERE cancel_expires IS NOT NULL OR cancel_trial_at IS NOT NULL OR cancel_banned
          ORDER BY cancel_expires DESC NULLS LAST`
       )).rows;
@@ -192,9 +195,10 @@ module.exports = function registerCancel(app, pool, { isValidDeviceId, escapeHtm
         const live = runningNow(s)
           ? '<br><b style="color:#2f855a;">🟢 скрипт работает</b>'
           : (s.cancel_active_at ? `<br><span style="font-size:12px;color:#718096;">был ${fmt(s.cancel_active_at)}</span>` : '');
+        const runsHtml = s.cancel_runs > 0 ? `<br><span style="font-size:12px;color:#4a5568;">сработала ${s.cancel_runs} раз</span>` : '';
         const left = act ? `<br><span style="font-size:12px;font-weight:bold;color:#b7791f;">осталось ${Math.max(0, Math.floor((new Date(s.cancel_expires) - now) / 86400000))} дн.</span>` : '';
         return `<tr style="${act ? 'background:#fffff0;' : ''}">
-          <td style="white-space:nowrap;">${status}${live}</td>
+          <td style="white-space:nowrap;">${status}${live}${runsHtml}</td>
           <td><div style="font-weight:bold;">${escapeHtml(s.cancel_key || '—')}</div><div style="font-size:12px;color:#718096;">${s.cancel_trial_at ? 'тест ' + fmt(s.cancel_trial_at) : ''}</div></td>
           <td><div style="font-weight:600;">${s.device_info ? escapeHtml(s.device_info) : '<span style="color:#a0aec0;">—</span>'}</div>
             <code style="background:#feebc8;color:#c05621;padding:2px 6px;border-radius:4px;font-size:12px;">${escapeHtml(s.device_id)}</code></td>
