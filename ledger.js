@@ -33,22 +33,26 @@ module.exports = function registerLedger(app, pool, { escapeHtml, extend }) {
       created TIMESTAMP NOT NULL DEFAULT NOW()
     );
     ALTER TABLE pay_ledger ADD COLUMN IF NOT EXISTS deal_id BIGINT;
+    ALTER TABLE pay_ledger ADD COLUMN IF NOT EXISTS source VARCHAR(10) NOT NULL DEFAULT 'manual';
     CREATE INDEX IF NOT EXISTS pay_ledger_deal ON pay_ledger (deal_id);
-  `).then(() => pool.query(`
-    -- Прошлые подтверждённые заявки MIA попадают в журнал один раз (claim_id уникален).
-    INSERT INTO pay_ledger (device_id, amount, days, product, method, note, claim_id, paid_at)
-    SELECT device_id, price, days, product, 'MIA', 'заявка №' || id, id, COALESCE(decided, created)
-    FROM pay_claims WHERE status = 'ok'
-    ON CONFLICT (claim_id) DO NOTHING
-  `)).catch(err => console.error('pay_ledger init error:', err));
+  `).then(async () => {
+    // Разовая очистка по просьбе владельца: журнал начинается с нуля, всё вносится вручную.
+    // Старые заявки MIA больше не переносятся сами; новые подтверждения пишутся отдельным блоком (source = 'auto').
+    await pool.query('CREATE TABLE IF NOT EXISTS one_time_jobs (name VARCHAR(100) PRIMARY KEY, done_at TIMESTAMP NOT NULL DEFAULT NOW(), info TEXT)');
+    const job = await pool.query("INSERT INTO one_time_jobs (name, info) VALUES ('ledger_reset_2026_11_09', 'журнал оплат очищен') ON CONFLICT (name) DO NOTHING RETURNING name");
+    if (job.rows.length) {
+      await pool.query('DELETE FROM pay_ledger');
+      await pool.query('DELETE FROM pay_deals');
+    }
+  }).catch(err => console.error('pay_ledger init error:', err));
 
   /** Запись об оплате по подтверждённой заявке MIA. Повторный вызов с той же заявкой ничего не меняет. */
   async function recordClaim(claim) {
     try {
       await ready;
       await pool.query(
-        `INSERT INTO pay_ledger (device_id, amount, days, product, method, note, claim_id)
-         VALUES ($1, $2, $3, $4, 'MIA', $5, $6) ON CONFLICT (claim_id) DO NOTHING`,
+        `INSERT INTO pay_ledger (device_id, amount, days, product, method, note, claim_id, source)
+         VALUES ($1, $2, $3, $4, 'MIA', $5, $6, 'auto') ON CONFLICT (claim_id) DO NOTHING`,
         [claim.device_id, claim.price, claim.days, claim.product || 'radar', 'заявка №' + claim.id, claim.id]
       );
     } catch (e) { console.error('pay_ledger record error:', e.message); }
@@ -294,6 +298,15 @@ module.exports = function registerLedger(app, pool, { escapeHtml, extend }) {
       if (q) list = list.filter(c => [c.device_id, c.device_info, c.phone].some(v => String(v || '').toLowerCase().includes(q)));
       const t = totals.rows[0];
 
+      const histRows = rows => rows.map(h => `<tr><td>${day(h.paid_at)}</td>
+          <td><a href="/admin/ledger?device=${encodeURIComponent(h.device_id)}">${escapeHtml(h.device_id)}</a><br><span class="small">${label(h)}</span></td>
+          <td><b>${money(h.amount)}</b></td><td>${PRODUCTS[h.product] || h.product}${h.days ? ' · ' + h.days + ' дн.' : ''}${h.deal_id ? '<br><span class="small">часть долга №' + h.deal_id + '</span>' : ''}</td><td>${escapeHtml(h.method)}</td>
+          <td>${escapeHtml(h.note || '')}</td>
+          <td style="white-space:nowrap"><a href="/admin/ledger/edit?id=${h.id}" title="Изменить запись" style="text-decoration:none">✎</a> <form style="display:inline" method="POST" action="/admin/ledger/delete" onsubmit="return confirm('Удалить запись из журнала? Срок подписки не изменится.')"><input type="hidden" name="id" value="${h.id}"><button style="background:none;border:none;color:#c53030;cursor:pointer" title="Удалить запись">✕</button></form></td></tr>`).join('');
+      const histTable = (rows, empty) => `<div class="wrap"><table><tr><th>Дата</th><th>Клиент</th><th>Сумма</th><th>Что / срок</th><th>Как</th><th>Заметка</th><th style="width:60px"></th></tr>
+        ${histRows(rows) || `<tr><td colspan="7" style="padding:18px;color:#718096">${empty}</td></tr>`}</table></div>`;
+      const manualRows = history.rows.filter(h => h.source !== 'auto');
+      const autoRows = history.rows.filter(h => h.source === 'auto');
       const label = c => `${escapeHtml(c.device_info || '')}${c.phone ? ' · ' + escapeHtml(c.phone) : ''}`;
       const msg = req.query.msg ? `<div style="background:#ebf8ff;border:1px solid #90cdf4;padding:10px 14px;border-radius:8px;margin-bottom:14px">${escapeHtml(String(req.query.msg))}</div>` : '';
       const kpi = (title, val, col) => `<div style="flex:1;min-width:140px;background:#fff;border-radius:12px;padding:12px 14px;box-shadow:0 1px 3px rgba(0,0,0,.08)">
@@ -336,15 +349,13 @@ module.exports = function registerLedger(app, pool, { escapeHtml, extend }) {
         }).join('') || '<tr><td colspan="8" style="padding:18px;color:#718096">Пока нет записей</td></tr>'}
         </table></div>
 
-        <h3>📒 ${only ? 'Платежи клиента ' + escapeHtml(only) + ' · <a href="/admin/ledger" style="font-size:14px">показать все</a>' : 'Последние платежи'}</h3>
-        <div class="wrap"><table><tr><th>Дата</th><th>Клиент</th><th>Сумма</th><th>Что / срок</th><th>Как</th><th>Заметка</th><th></th></tr>
-        ${history.rows.map(h => `<tr><td>${day(h.paid_at)}</td>
-          <td><a href="/admin/ledger?device=${encodeURIComponent(h.device_id)}">${escapeHtml(h.device_id)}</a><br><span class="small">${label(h)}</span></td>
-          <td><b>${money(h.amount)}</b></td><td>${PRODUCTS[h.product] || h.product}${h.days ? ' · ' + h.days + ' дн.' : ''}${h.deal_id ? '<br><span class="small">часть долга №' + h.deal_id + '</span>' : ''}</td><td>${escapeHtml(h.method)}</td>
-          <td>${escapeHtml(h.note || '')}</td>
-          <td style="white-space:nowrap"><a href="/admin/ledger/edit?id=${h.id}" title="Изменить запись" style="text-decoration:none">✎</a> <form style="display:inline" method="POST" action="/admin/ledger/delete" onsubmit="return confirm('Удалить запись из журнала? Срок подписки не изменится.')"><input type="hidden" name="id" value="${h.id}"><button style="background:none;border:none;color:#c53030;cursor:pointer" title="Удалить запись">✕</button></form></td></tr>`).join('')
-          || '<tr><td colspan="7" style="padding:18px;color:#718096">Пока нет записей</td></tr>'}
-        </table></div></body></html>`);
+        <h3>✍️ ${only ? 'Мои записи клиента ' + escapeHtml(only) + ' · <a href="/admin/ledger" style="font-size:14px">показать все</a>' : 'Мои записи (внесены вручную)'}</h3>
+        ${histTable(manualRows, 'Пока пусто — вносите оплату формой выше')}
+
+        <h3>🤖 Автоматически: подтверждённые заявки MIA</h3>
+        <div class="small" style="margin-bottom:6px">Сюда попадают оплаты, у которых вы нажали «✓ Пришло» в Telegram или в «Заявках MIA». Это отдельный список, ваши записи он не трогает.</div>
+        ${histTable(autoRows, 'Пока нет подтверждённых заявок')}
+        </body></html>`);
     } catch (e) {
       console.error('ledger page error:', e);
       res.status(500).send('Ошибка: ' + escapeHtml(e.message));
