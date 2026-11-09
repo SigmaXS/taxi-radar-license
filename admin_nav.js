@@ -2,7 +2,8 @@
 // чтобы переключаться одним нажатием, а не искать маленькие ссылки.
 const TABS = [
   ['/admin/view-devices', '📱 Устройства'],
-  ['/admin/payments', '💰 Оплаты'],
+  ['/admin/payments', '💰 Заявки MIA'],
+  ['/admin/ledger', '🧾 Журнал оплат'],
   ['/admin/trips', '🚕 Поездки'],
   ['/admin/community', '💬 Сообщество'],
   ['/admin/events', '🎫 События'],

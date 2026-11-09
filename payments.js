@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { adminNav } = require('./admin_nav');
 
 module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeHtml, parseTariffs, rewardReferrer }) {
+  let ledger = null;
   pool.query(`
     CREATE TABLE IF NOT EXISTS pay_claims (
       id BIGSERIAL PRIMARY KEY,
@@ -193,6 +194,7 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
     let result;
     if (action === 'ok') {
       const d = await extend(upd.rows[0]);
+      if (ledger) await ledger.recordClaim(upd.rows[0]);
       result = d.status === 'banned' ? '⚠️ Отмечено как оплачено, но устройство в бане — срок продлён, бан не снят.' : `✓ Подписка продлена до ${fmt(d.expires)}`;
     } else result = '✗ Заявка отклонена. Водитель увидит «оплата не найдена».';
     telegram('sendMessage', { text: `Заявка №${num}: ${result}` });
@@ -208,6 +210,8 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
     res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Оплаты</title>
       <style>body{font-family:system-ui,sans-serif;margin:25px}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #edf2f7;font-size:14px;text-align:left;vertical-align:top}th{background:#2b6cb0;color:#fff}</style></head><body>${adminNav('/admin/payments')}
       <h2>Оплаты MIA</h2>
+      <p><a href="/admin/ledger" style="font-weight:bold">🧾 Журнал оплат: кто сколько заплатил и когда ждать следующую оплату →</a></p>
+      ${ledger ? ledger.formHtml() : ''}
       <p style="color:#4a5568;font-size:14px;">Номер для перевода: <b>${escapeHtml(miaPhone())}</b>${process.env.MIA_NAME ? ' · ' + escapeHtml(process.env.MIA_NAME) : ''}.
       ${process.env.TELEGRAM_BOT_TOKEN && chatId() ? 'Заявки приходят в Telegram.' : 'Чтобы заявки приходили в Telegram, задайте TELEGRAM_BOT_TOKEN и TELEGRAM_PAY_CHAT_ID (или TELEGRAM_ADMIN_CHAT_ID).'}</p>
       <table><tr><th>№</th><th>Когда</th><th>Сумма</th><th>Телефон</th><th>ID</th><th>Статус</th></tr>
@@ -216,6 +220,9 @@ module.exports = function registerPayments(app, pool, { isValidDeviceId, escapeH
         <td>${st(c.status)}${c.status === 'new' ? `<br><a href="/pay/ok/${c.id}/${sign(Number(c.id), 'ok')}">✓ пришло</a> · <a href="/pay/no/${c.id}/${sign(Number(c.id), 'no')}">✗ нет</a>` : ''}</td></tr>`).join('')}
       </table></body></html>`);
   });
+
+  // Журнал оплат (/admin/ledger): сюда же пишутся подтверждённые заявки.
+  ledger = require('./ledger')(app, pool, { escapeHtml, extend });
 
   return { configFields };
 };

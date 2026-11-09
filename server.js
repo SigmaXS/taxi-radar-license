@@ -472,7 +472,8 @@ app.post('/api/referral/me', async (req, res) => {
       revoked: parseInt(stats.rows[0].revoked, 10),
       check_days: referralCheckDays(),
       bonus_days: referralBonusDays(),
-      install_days: referralInstallDays()
+      install_days: referralInstallDays(),
+      cancel_days: Math.max(0, parseInt(process.env.CANCEL_REFERRAL_DAYS || '1', 10) || 0)
     });
   } catch (err) {
     console.error(err);
@@ -748,7 +749,11 @@ app.get('/admin/view-devices', async (req, res) => {
     const daysLeftOf = d => (new Date(d.expires).getTime() - now) / 86400e3;
     const isPaid = d => d.status !== 'banned' && d.status !== 'disabled' && daysLeftOf(d) > 7;
     const shown = devicesQuery.rows
-      .filter(d => !q || [d.device_id, d.key_code, d.device_info, d.type].some(v => String(v || '').toLowerCase().includes(q)))
+      .filter(d => {
+        if (!q) return true;
+        const r = refByDevice.get(d.device_id);   // ещё ищем по коду друга: своему и тому, по которому человек пришёл
+        return [d.device_id, d.key_code, d.device_info, d.type, r && r.code, r && r.referred_by].some(v => String(v || '').toLowerCase().includes(q));
+      })
       .sort((a, b) => (isPaid(b) - isPaid(a)) || (new Date(b.last_seen || 0) - new Date(a.last_seen || 0)));
     const paidCount = shown.filter(isPaid).length;
     let groupShown = '';
