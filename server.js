@@ -46,6 +46,8 @@ async function initDB() {
         device_id VARCHAR(100) PRIMARY KEY
       );
       ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_info VARCHAR(150);
+      -- Когда устройство впервые появилось на сервере: код друга можно ввести только в первые дни.
+      ALTER TABLE devices ADD COLUMN IF NOT EXISTS first_seen TIMESTAMP NOT NULL DEFAULT NOW();
       CREATE TABLE IF NOT EXISTS referrals (
         device_id VARCHAR(100) PRIMARY KEY,
         code VARCHAR(12) UNIQUE NOT NULL,
@@ -495,8 +497,33 @@ app.post('/api/referral/apply', async (req, res) => {
     if (own.referred_by) return res.json({ ok: false, message: "Код друга уже введён" });
     if (own.code === cleanCode) return res.json({ ok: false, message: "Нельзя ввести свой собственный код" });
 
-    const referrer = await pool.query('SELECT 1 FROM referrals WHERE code = $1', [cleanCode]);
+    const referrer = await pool.query('SELECT device_id FROM referrals WHERE code = $1', [cleanCode]);
     if (referrer.rows.length === 0) return res.json({ ok: false, message: "Код не найден" });
+
+    // 1–2. Нельзя вводить код того, кто сам (напрямую или через цепочку друзей) пришёл по нашему коду.
+    let cur = referrer.rows[0].device_id;
+    for (let step = 0; step < 20 && cur; step++) {
+      if (cur === device_id) {
+        return res.json({ ok: false, message: step === 1
+          ? "Нельзя ввести код того, кого вы пригласили"
+          : "Нельзя ввести код человека из вашей цепочки приглашений" });
+      }
+      const up = await pool.query(
+        'SELECT p.device_id FROM referrals me JOIN referrals p ON p.code = me.referred_by WHERE me.device_id = $1', [cur]);
+      cur = up.rows.length ? up.rows[0].device_id : null;
+    }
+
+    // 3. Код друга — только для новых устройств: в первые REFERRAL_ENTER_DAYS дней (0 — без ограничения).
+    const enterDays = parseInt(process.env.REFERRAL_ENTER_DAYS || '3', 10);
+    if (Number.isFinite(enterDays) && enterDays > 0) {
+      const age = await pool.query(
+        `SELECT LEAST(d.first_seen, COALESCE(r.created, d.first_seen)) AS since
+           FROM devices d LEFT JOIN referrals r ON r.device_id = d.device_id WHERE d.device_id = $1`, [device_id]);
+      const since = age.rows[0] && age.rows[0].since;
+      if (since && Date.now() - new Date(since).getTime() > enterDays * 86400e3) {
+        return res.json({ ok: false, message: `Код друга можно ввести только в первые ${enterDays} дн. после установки` });
+      }
+    }
 
     const updated = await pool.query(
       'UPDATE referrals SET referred_by = $1 WHERE device_id = $2 AND referred_by IS NULL RETURNING 1',
