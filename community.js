@@ -59,6 +59,8 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       deleted BOOLEAN NOT NULL DEFAULT false
     );
     CREATE INDEX IF NOT EXISTS chat_messages_created ON chat_messages (created);
+    ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_to BIGINT;
+    ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
     CREATE TABLE IF NOT EXISTS client_tags (
       phone_hash CHAR(64) NOT NULL,
       device_id VARCHAR(100) NOT NULL,
@@ -224,16 +226,30 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
   }));
 
   // after — id последнего сообщения, что уже есть у приложения; без него — последние 50.
+  const CHAT_COLS = `m.id, m.device_id, m.nickname, m.text, m.created, m.reply_to, m.edited_at,
+           COALESCE(u.is_admin, false) AS admin, r.nickname AS reply_nick, r.text AS reply_text, r.deleted AS reply_deleted`;
+  const CHAT_FROM = `FROM chat_messages m LEFT JOIN chat_users u ON u.device_id = m.device_id
+           LEFT JOIN chat_messages r ON r.id = m.reply_to`;
+  const chatDto = (m, deviceId) => ({
+    id: Number(m.id),
+    nickname: m.nickname,
+    text: m.text,
+    ts: new Date(m.created).toISOString(),
+    mine: m.device_id === deviceId,
+    admin: m.admin === true,
+    edited: !!m.edited_at,
+    reply_to: m.reply_to ? Number(m.reply_to) : null,
+    reply_nick: m.reply_to && !m.reply_deleted ? m.reply_nick : null,
+    reply_text: m.reply_to && !m.reply_deleted ? String(m.reply_text || '').slice(0, 80) : null
+  });
   app.post('/api/chat/list', member(async (req, res, deviceId) => {
     const after = parseInt(req.body.after, 10);
     const rows = Number.isFinite(after) && after > 0
       ? (await pool.query(
-        `SELECT m.id, m.device_id, m.nickname, m.text, m.created, COALESCE(u.is_admin, false) AS admin
-         FROM chat_messages m LEFT JOIN chat_users u ON u.device_id = m.device_id
+        `SELECT ${CHAT_COLS} ${CHAT_FROM}
          WHERE m.id > $1 AND NOT m.deleted ORDER BY m.id LIMIT 100`, [after])).rows
       : (await pool.query(
-        `SELECT * FROM (SELECT m.id, m.device_id, m.nickname, m.text, m.created, COALESCE(u.is_admin, false) AS admin
-         FROM chat_messages m LEFT JOIN chat_users u ON u.device_id = m.device_id
+        `SELECT * FROM (SELECT ${CHAT_COLS} ${CHAT_FROM}
          WHERE NOT m.deleted ORDER BY m.id DESC LIMIT 50) t ORDER BY id`)).rows;
     const me = (await pool.query('SELECT nickname, muted, is_admin FROM chat_users WHERE device_id = $1', [deviceId])).rows[0];
     // Удалённые админом сообщения приложение должно убрать у себя.
@@ -241,18 +257,18 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
       ? (await pool.query(
         `SELECT id FROM chat_messages WHERE deleted AND id > $1 - 200`, [after])).rows.map(r => Number(r.id))
       : [];
+    // Свежие правки уже показанных сообщений (приложение опрашивает раз в 4 секунды).
+    const edits = Number.isFinite(after) && after > 0
+      ? (await pool.query(
+        `SELECT id, text FROM chat_messages WHERE NOT deleted AND edited_at > NOW() - INTERVAL '2 minutes' AND id <= $1 AND id > $1 - 300`, [after]))
+        .rows.map(r => ({ id: Number(r.id), text: r.text }))
+      : [];
     res.json({
       ok: true,
       me: me ? { nickname: me.nickname, muted: me.muted, admin: me.is_admin } : null,
       deleted,
-      messages: rows.map(m => ({
-        id: Number(m.id),
-        nickname: m.nickname,
-        text: m.text,
-        ts: new Date(m.created).toISOString(),
-        mine: m.device_id === deviceId,
-        admin: m.admin === true
-      }))
+      edits,
+      messages: rows.map(m => chatDto(m, deviceId))
     });
   }));
 
@@ -298,11 +314,53 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     if (tooOften('chat3s:' + deviceId, 1, 3000) || tooOften('chat10m:' + deviceId, 30, 10 * 60 * 1000)) {
       return res.json({ ok: false, message: 'Слишком часто — подождите немного' });
     }
+    let replyTo = parseInt(req.body.reply_to, 10);
+    if (Number.isFinite(replyTo) && replyTo > 0) {
+      const target = (await pool.query('SELECT 1 FROM chat_messages WHERE id = $1 AND NOT deleted', [replyTo])).rows[0];
+      if (!target) replyTo = null;
+    } else replyTo = null;
     const r = await pool.query(
-      'INSERT INTO chat_messages (device_id, nickname, text) VALUES ($1, $2, $3) RETURNING id, created',
-      [deviceId, me.nickname, text]
+      'INSERT INTO chat_messages (device_id, nickname, text, reply_to) VALUES ($1, $2, $3, $4) RETURNING id, created',
+      [deviceId, me.nickname, text, replyTo]
     );
     res.json({ ok: true, id: Number(r.rows[0].id) });
+  }));
+
+  // Свои сообщения: изменить (в течение суток) и удалить.
+  app.post('/api/chat/edit', member(async (req, res, deviceId) => {
+    const id = parseInt(req.body.id, 10);
+    const text = cleanText(req.body.text, 500);
+    if (!text) return res.json({ ok: false, message: 'Пустое сообщение' });
+    const me = (await pool.query('SELECT muted FROM chat_users WHERE device_id = $1', [deviceId])).rows[0];
+    if (!me || me.muted) return res.json({ ok: false, message: 'Вам запрещено писать в чат' });
+    const r = await pool.query(
+      `UPDATE chat_messages SET text = $3, edited_at = NOW()
+        WHERE id = $1 AND device_id = $2 AND NOT deleted AND created > NOW() - INTERVAL '1 day' RETURNING id`, [id, deviceId, text]);
+    if (!r.rows.length) return res.json({ ok: false, message: 'Это сообщение уже нельзя изменить' });
+    res.json({ ok: true });
+  }));
+
+  app.post('/api/chat/delete', member(async (req, res, deviceId) => {
+    const id = parseInt(req.body.id, 10);
+    const r = await pool.query('UPDATE chat_messages SET deleted = true WHERE id = $1 AND device_id = $2 AND NOT deleted RETURNING id', [id, deviceId]);
+    if (!r.rows.length) return res.json({ ok: false, message: 'Сообщение не найдено' });
+    res.json({ ok: true });
+  }));
+
+  // Мне ответили или назвали по нику (@ник) после after — для уведомления. after = 0: только запомнить позицию.
+  app.post('/api/chat/mentions', member(async (req, res, deviceId) => {
+    const after = parseInt(req.body.after, 10) || 0;
+    const last = Number((await pool.query('SELECT COALESCE(MAX(id), 0) AS n FROM chat_messages')).rows[0].n);
+    if (after <= 0) return res.json({ ok: true, last_id: last, items: [] });
+    const me = (await pool.query('SELECT nickname FROM chat_users WHERE device_id = $1', [deviceId])).rows[0];
+    if (!me) return res.json({ ok: true, last_id: last, items: [] });
+    const rows = (await pool.query(
+      `SELECT m.id, m.nickname, m.text, (r.device_id = $2) AS is_reply
+         FROM chat_messages m LEFT JOIN chat_messages r ON r.id = m.reply_to
+        WHERE m.id > $1 AND NOT m.deleted AND m.device_id <> $2
+          AND (r.device_id = $2 OR POSITION(LOWER('@' || $3) IN LOWER(m.text)) > 0)
+        ORDER BY m.id DESC LIMIT 3`, [after, deviceId, me.nickname])).rows;
+    res.json({ ok: true, last_id: last, items: rows.map(r => ({ id: Number(r.id), nickname: r.nickname, text: String(r.text).slice(0, 120), reply: r.is_reply === true })) });
   }));
 
   // ---------- клиенты ----------
