@@ -207,7 +207,7 @@ module.exports = function registerScout(app, { member, escapeHtml = s => String(
     if (!scouts().includes(deviceId)) return res.status(403).json({ ok: false, code: 'not_scout' });
     const { lat, lon } = req.body;
     const v = req.body.values || {};
-    const values = { econom: v.econom ?? null, comfort: v.comfort ?? null, comfortplus: v.comfortplus ?? null };
+    const values = { econom: v.econom ?? null, comfort: v.comfort ?? null, comfortplus: v.comfortplus ?? null, express: v.express ?? null };
     if (!okCoord(lat, lon) || !Object.values(values).every(okSurge)) return res.status(400).json({ ok: false, code: 'bad_result' });
     const value = single(values);
     const key = cellOf(lat, lon);

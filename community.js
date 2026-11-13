@@ -911,9 +911,9 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
 
   const geocoder = require('./geocoder')(pool);
   app.locals.routeStats = require('./offer-routing')(app, { member, tooOften, geocoder, pool });
-  // Разведчик надбавки (scout.js) пока выключен: надбавка — с сайта Яндекса. Радар 2.4 на /api/scout/near
-  // получает 404 и берёт надбавку с сайта. Вернуть — раскомментировать строку ниже и вкладку в admin_nav.js.
-  // app.locals.scoutStats = require('./scout')(app, { member, escapeHtml, pool });
+  // Разведчик (scout.js) — только для доставки: такси радар берёт с сайта Яндекса, а доставку сайт не отдаёт,
+  // её читает телефон-разведчик в Яндекс Go. Водители без «Доставки» к нему не обращаются.
+  app.locals.scoutStats = require('./scout')(app, { member, escapeHtml, pool });
 
   // События (концерты, матчи): /admin/events и /api/events/list.
   require('./events')(app, pool, { member, escapeHtml, geocoder });
