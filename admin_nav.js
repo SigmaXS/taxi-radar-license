@@ -12,6 +12,7 @@ const TABS = [
   ['/admin/crashes', '🐞 Ошибки'],
   ['/admin/apk', '⬆️ Обновление'],
   ['/admin/cancel', '🚫 Отмена'],
+  ['/admin/contest', '🏆 Конкурс'],
 ];
 
 function adminNav(active) {

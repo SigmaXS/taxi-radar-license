@@ -475,6 +475,156 @@ module.exports = function registerCommunity(app, pool, { isValidDeviceId, escape
     res.json({ ok: true, ...(await clientSummary(hash, deviceId)) });
   }));
 
+  // ---------- конкурс «кто больше добавит клиентов за неделю» ----------
+  // Номер засчитывается, только если радар сам поймал его при звонке клиенту из Яндекс Про
+  // (/api/clients/call). Вручную введённые номера не считаются. Защита от накрутки:
+  //  - номер засчитывается один раз и только первому водителю (повтор и исправление — нет);
+  //  - номер, который уже был в базе у другого водителя, — не новый;
+  //  - только молдавские мобильные +373 6/7…;
+  //  - не больше CONTEST_DAY_LIMIT номеров в сутки;
+  //  - в таблицу идут только номера, рядом с которыми (±3 ч) у водителя есть настоящая поездка (trip_reports).
+  // Неделя — с понедельника 00:00 по Кишинёву. Включается/выключается в /admin/contest.
+  const CONTEST_DAY_LIMIT = 25;
+  const contestReady = pool.query(`
+    CREATE TABLE IF NOT EXISTS contest_numbers (
+      phone_hash CHAR(64) PRIMARY KEY,
+      device_id VARCHAR(100) NOT NULL,
+      created TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS contest_numbers_device ON contest_numbers (device_id, created);
+    CREATE TABLE IF NOT EXISTS admin_kv (k VARCHAR(40) PRIMARY KEY, v TEXT NOT NULL);
+  `).catch(err => console.error('contest table', err));
+
+  async function contestSettings() {
+    await contestReady;
+    const rows = (await pool.query(`SELECT k, v FROM admin_kv WHERE k IN ('contest_on', 'contest_prize')`)).rows;
+    const kv = Object.fromEntries(rows.map(r => [r.k, r.v]));
+    return {
+      on: kv.contest_on !== '0',
+      prize: kv.contest_prize || 'Радар на месяц + 7 дней «Отмены»'
+    };
+  }
+
+  const WEEK_START = `(date_trunc('week', NOW() AT TIME ZONE 'Europe/Chisinau') AT TIME ZONE 'Europe/Chisinau')`;
+
+  // Таблица недели: только номера с настоящей поездкой рядом по времени.
+  // trip_reports.created — TIMESTAMP без пояса (время сервера), поэтому сравниваем через ::timestamp.
+  async function contestTop(limit) {
+    return (await pool.query(
+      `SELECT c.device_id, COUNT(*) AS n, MAX(u.nickname) AS nickname
+       FROM contest_numbers c
+       LEFT JOIN chat_users u ON u.device_id = c.device_id
+       WHERE c.created >= ${WEEK_START}
+         AND EXISTS (SELECT 1 FROM trip_reports t WHERE t.device_id = c.device_id
+                     AND t.created BETWEEN (c.created - INTERVAL '3 hours')::timestamp
+                                       AND (c.created + INTERVAL '3 hours')::timestamp)
+       GROUP BY c.device_id
+       ORDER BY n DESC, MIN(c.created) ASC
+       LIMIT $1`, [limit]
+    )).rows.map(r => ({ device_id: r.device_id, n: Number(r.n), nickname: r.nickname }));
+  }
+
+  async function contestState(deviceId) {
+    const s = await contestSettings();
+    if (!s.on) return { on: false };
+    const top = await contestTop(500);
+    const idx = top.findIndex(r => r.device_id === deviceId);
+    const added = Number((await pool.query(
+      `SELECT COUNT(*) AS n FROM contest_numbers WHERE device_id = $1 AND created >= ${WEEK_START}`, [deviceId]
+    )).rows[0].n);
+    const ends = (await pool.query(`SELECT (${WEEK_START} + INTERVAL '7 days') AS e`)).rows[0].e;
+    return {
+      on: true,
+      prize: s.prize,
+      ends,
+      mine: { n: idx >= 0 ? top[idx].n : 0, place: idx >= 0 ? idx + 1 : null, added },
+      // Других показываем по нику из чата или «Водитель …abcd» — без номеров и ID целиком.
+      top: top.slice(0, 5).map((r, i) => ({
+        place: i + 1,
+        name: r.nickname || ('Водитель …' + String(r.device_id).slice(-4)),
+        n: r.n,
+        me: r.device_id === deviceId
+      }))
+    };
+  }
+
+  // Радар поймал номер при звонке клиенту из Яндекс Про.
+  app.post('/api/clients/call', member(async (req, res, deviceId) => {
+    const phone = cleanPhone(req.body.phone);
+    const s = await contestSettings();
+    let counted = false;
+    let reason = 'off';
+    if (s.on && phone) {
+      const hash = phoneHash(phone);
+      if (!/^\+373[67]\d{7}$/.test(phone)) reason = 'not_md_mobile';
+      else if ((await pool.query(
+        'SELECT 1 FROM client_tags WHERE phone_hash = $1 AND device_id <> $2 LIMIT 1', [hash, deviceId]
+      )).rows.length) reason = 'known';
+      else {
+        const today = Number((await pool.query(
+          `SELECT COUNT(*) AS n FROM contest_numbers WHERE device_id = $1 AND created > NOW() - INTERVAL '1 day'`, [deviceId]
+        )).rows[0].n);
+        if (today >= CONTEST_DAY_LIMIT) reason = 'day_limit';
+        else {
+          const r = await pool.query(
+            'INSERT INTO contest_numbers (phone_hash, device_id) VALUES ($1, $2) ON CONFLICT (phone_hash) DO NOTHING', [hash, deviceId]
+          );
+          counted = r.rowCount === 1;
+          reason = counted ? 'new' : 'known';
+        }
+      }
+    }
+    res.json({ ok: true, counted, reason, contest: await contestState(deviceId) });
+  }));
+
+  app.post('/api/contest', member(async (req, res, deviceId) => {
+    res.json({ ok: true, ...(await contestState(deviceId)) });
+  }));
+
+  app.get('/admin/contest', async (req, res) => {
+    try {
+      const s = await contestSettings();
+      const top = await contestTop(30);
+      const raw = (await pool.query(
+        `SELECT device_id, COUNT(*) AS n FROM contest_numbers WHERE created >= ${WEEK_START} GROUP BY device_id ORDER BY n DESC LIMIT 30`
+      )).rows;
+      const rawBy = Object.fromEntries(raw.map(r => [r.device_id, Number(r.n)]));
+      const rows = top.map((r, i) => `<tr><td>${i + 1}</td><td>${escapeHtml(r.nickname || '')}</td>
+        <td>${escapeHtml(r.device_id)}</td><td><b>${r.n}</b></td><td>${rawBy[r.device_id] || 0}</td></tr>`).join('');
+      res.send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>Конкурс</title><body style="font-family:sans-serif;padding:25px;background:#f0f2f5">
+      ${require('./admin_nav').adminNav('/admin/contest')}
+      <h2>🏆 Конкурс недели: ${s.on ? 'идёт' : 'выключен'}</h2>
+      <form method="post" action="/admin/contest" style="margin-bottom:16px">
+        <input name="prize" value="${escapeHtml(s.prize)}" style="width:min(420px,90%);padding:8px">
+        <button name="on" value="${s.on ? '1' : '0'}" style="padding:8px 14px">Сохранить приз</button>
+        <button name="on" value="${s.on ? '0' : '1'}" style="padding:8px 14px">${s.on ? 'Выключить конкурс' : 'Включить конкурс'}</button>
+      </form>
+      <p>«Засчитано» — номера, рядом с которыми (±3 ч) у водителя есть поездка. «Всего» — все новые номера, пойманные радаром за неделю.
+      Если «Всего» намного больше «Засчитано» — похоже на накрутку. Приз выдаётся вручную в «Устройствах».</p>
+      <table border="1" cellpadding="6" style="border-collapse:collapse;background:#fff">
+      <tr><th>#</th><th>Ник</th><th>Устройство</th><th>Засчитано</th><th>Всего</th></tr>${rows || '<tr><td colspan="5">Пока никого</td></tr>'}</table>
+      </body>`);
+    } catch (err) {
+      console.error(err);
+      res.status(500).send('Ошибка');
+    }
+  });
+
+  app.post('/admin/contest', require('express').urlencoded({ extended: false }), async (req, res) => {
+    try {
+      await contestReady;
+      const on = req.body.on === '0' ? '0' : '1';
+      const prize = String(req.body.prize || '').slice(0, 120).trim();
+      await pool.query(`INSERT INTO admin_kv (k, v) VALUES ('contest_on', $1) ON CONFLICT (k) DO UPDATE SET v = $1`, [on]);
+      if (prize) await pool.query(`INSERT INTO admin_kv (k, v) VALUES ('contest_prize', $1) ON CONFLICT (k) DO UPDATE SET v = $1`, [prize]);
+      res.redirect('/admin/contest');
+    } catch (err) {
+      console.error(err);
+      res.status(500).send('Ошибка');
+    }
+  });
+
   // ---------- метки на дороге ----------
 
   function validPoint(lat, lon) {
